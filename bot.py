@@ -261,23 +261,19 @@ def extract_group_payment(text: str) -> Optional[tuple]:
     note = ""
 
     # --- USD patterns ---
-    # Standard $12.34
     m = re.search(r"\$(\d+\.?\d*)", text)
     if m:
         usd = float(m.group(1))
 
-    # ACLEDA / other bank: "SALE 30.00 USD"
     m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
     if m:
         usd = float(m.group(1))
 
     # --- KHR patterns ---
-    # ៛100 or ៛ 1,000
     m = re.search(r"៛\s*([\d,]+)", text)
     if m:
         khr = float(m.group(1).replace(",", ""))
     else:
-        # "ចំនួន 50,000 រៀល"
         m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
         if m:
             khr = float(m.group(1).replace(",", ""))
@@ -286,18 +282,15 @@ def extract_group_payment(text: str) -> Optional[tuple]:
         return None
 
     # --- Build a meaningful note ---
-    # 1. ABA PayWay: "paid by <Name>"
     payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
 
-    # 2. Khmer notifications: "ពី <Name>"
     if not note:
         khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
         if khmer_payer:
             note = khmer_payer.group(1).strip()
 
-    # 3. ACLEDA: card number
     if not note:
         card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
         if card_match:
@@ -311,11 +304,9 @@ def extract_group_payment(text: str) -> Optional[tuple]:
                 if pos_match:
                     note = "POS: " + pos_match.group(1)
 
-    # 4. Fallback: first line trimmed
     if not note:
         note = text.split("\n")[0].strip()[:80]
 
-    # Optionally append transaction ID if present (ABA PayWay)
     trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
     if trx_match:
         note += f" (Trx: {trx_match.group(1)})"
@@ -354,6 +345,42 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     data.append(entry)
     save_data(data)
     logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id}")
+
+# ---------- Group Command: /daily ----------
+async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /daily command inside a monitored group – show today's totals for this group."""
+    if not update.message or update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+
+    # Uncomment the next two lines to restrict to owner only
+    # if update.effective_user.id != OWNER_ID:
+    #     return
+
+    today = datetime.date.today()
+    date_str = today.strftime("%Y-%m-%d")
+    data = load_data()
+
+    group_id = update.message.chat.id
+    entries = [
+        e for e in data
+        if e["date"] == date_str and e.get("source", "").startswith(f"group_{group_id}_")
+    ]
+
+    if not entries:
+        await update.message.reply_text(f"គ្មានប្រតិបត្តិការថ្ងៃនេះសម្រាប់ក្រុមនេះទេ។")
+        return
+
+    total_usd = sum(e["usd"] for e in entries)
+    total_khr = sum(e["khr"] for e in entries)
+    count_usd = sum(1 for e in entries if e["usd"] > 0)
+    count_khr = sum(1 for e in entries if e["khr"] > 0)
+
+    text = (
+        f"📊 សរុបថ្ងៃនេះ ({date_str}) សម្រាប់ក្រុមនេះ៖\n"
+        f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}\n"
+        f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
+    )
+    await update.message.reply_text(text)
 
 # ---------- Main private message handler ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -419,7 +446,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=MAIN_KEYBOARD,
     )
 
-# ---------- Background PayWay sync thread (runs only if credentials present) ----------
+# ---------- Background PayWay sync thread ----------
 def sync_worker(bot_token: str) -> None:
     while True:
         try:
@@ -454,11 +481,14 @@ application.add_handler(CommandHandler("day", day_report))
 application.add_handler(CommandHandler("sync", manual_sync))
 application.add_handler(CommandHandler("sync_status", sync_status))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
-# Group monitoring handler (must be before the general private handler)
+# Group monitoring handler (silent recording)
 application.add_handler(MessageHandler(
     filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
     group_message_handler
 ))
+# Group command: /daily (only in monitored groups)
+application.add_handler(CommandHandler("daily", group_daily_command, filters=filters.ChatType.GROUPS))
+# Private chat handler (fallback)
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
@@ -485,7 +515,7 @@ def set_webhook():
     result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
 
-# Start PayWay sync thread (will do nothing if credentials missing)
+# Start PayWay sync thread (does nothing if credentials empty)
 sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True)
 sync_thread.start()
 
