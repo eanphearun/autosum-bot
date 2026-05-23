@@ -6,7 +6,7 @@ import re
 import logging
 import time
 import threading
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import requests
 from flask import Flask, request
@@ -30,14 +30,14 @@ SYNC_STATE_FILE = "sync_state.json"
 
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
-# PayWay (ABA) API credentials – leave empty if not using API sync
+# PayWay (ABA) API credentials – leave empty to disable
 PAYWAY_MERCHANT_ID = os.environ.get("PAYWAY_MERCHANT_ID", "")
 PAYWAY_API_KEY = os.environ.get("PAYWAY_API_KEY", "")
 PAYWAY_BASE_URL = os.environ.get("PAYWAY_BASE_URL", "https://www.payway.com.kh/api/v1")
 PAYWAY_BUSINESS = os.environ.get("PAYWAY_BUSINESS", "birdnest")
 SYNC_INTERVAL_MINUTES = int(os.environ.get("SYNC_INTERVAL_MINUTES", "5"))
 
-# Group monitoring – list of group chat IDs to watch
+# Group monitoring
 MONITORED_GROUP_IDS = [
     int(gid.strip())
     for gid in os.environ.get("MONITORED_GROUP_IDS", "").split(",")
@@ -45,7 +45,20 @@ MONITORED_GROUP_IDS = [
 ]
 GROUP_BUSINESS_TAG = os.environ.get("GROUP_BUSINESS_TAG", "group_payments")
 
-# In‑memory set to avoid duplicate processing of the same group message
+# Per‑group business tag mapping (format: "group_id1:tag1,group_id2:tag2")
+_group_map_str = os.environ.get("GROUP_BUSINESS_MAP", "")
+group_business_map: Dict[int, str] = {}
+if _group_map_str:
+    for pair in _group_map_str.split(","):
+        parts = pair.strip().split(":")
+        if len(parts) == 2:
+            try:
+                gid = int(parts[0].strip())
+                tag = parts[1].strip()
+                group_business_map[gid] = tag
+            except ValueError:
+                logger.warning(f"Invalid group ID in GROUP_BUSINESS_MAP: {parts[0]}")
+
 processed_group_messages: Set[int] = set()
 
 # Categories
@@ -76,8 +89,8 @@ def save_sync_state(state: Dict[str, Any]) -> None:
     with open(SYNC_STATE_FILE, "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def extract_amounts(text: str):
-    """Extract USD and KHR from a manually typed message."""
+def extract_amounts(text: str) -> Tuple[float, float, str]:
+    """Extract USD and KHR from manually typed messages."""
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
     khr = int(khr_match.group(1).replace(",", "")) if khr_match else 0
@@ -98,7 +111,7 @@ def summarise(entries: list, label: str) -> str:
     cat_summary = {}
     for e in entries:
         cat = e.get("category", "other")
-        cat_summary[cat] = cat_summary.get(cat, 0) + e.get("usd",0) + e.get("khr",0)/4000
+        cat_summary[cat] = cat_summary.get(cat, 0) + e.get("usd", 0) + e.get("khr", 0) / 4000
     lines = [
         f"សរុបប្រតិបត្តិការ {label}",
         f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}",
@@ -138,7 +151,10 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data:
         removed = data.pop()
         save_data(data)
-        await update.message.reply_text(f"🗑 បានលុបធាតុចុងក្រោយ: {removed.get('note','')} | ${removed.get('usd',0):.2f} / ៛{removed.get('khr',0):,}")
+        await update.message.reply_text(
+            f"🗑 បានលុបធាតុចុងក្រោយ: {removed.get('note','')} | "
+            f"${removed.get('usd',0):.2f} / ៛{removed.get('khr',0):,}"
+        )
     else:
         await update.message.reply_text("គ្មានទិន្នន័យសម្រាប់លុប។")
 
@@ -165,7 +181,7 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     save_data(data)
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
 
-# ---------- PayWay Sync (only works if credentials are provided) ----------
+# ---------- PayWay Sync (optional) ----------
 def fetch_payway_transactions() -> List[Dict[str, Any]]:
     if not PAYWAY_MERCHANT_ID or not PAYWAY_API_KEY:
         return []
@@ -251,25 +267,21 @@ async def sync_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(msg)
 
 # ---------- Group Payment Monitoring ----------
-def extract_group_payment(text: str) -> Optional[tuple]:
-    """
-    Try to extract (usd, khr, note) from bank/payway/ACLEDA notification messages.
-    Returns None if it doesn't look like a payment notification.
-    """
+def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
+    """Parse bank/payway/ACLEDA notification messages. Returns (usd, khr, note) or None."""
     usd = 0.0
     khr = 0.0
     note = ""
 
-    # --- USD patterns ---
+    # USD patterns
     m = re.search(r"\$(\d+\.?\d*)", text)
     if m:
         usd = float(m.group(1))
-
     m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
     if m:
         usd = float(m.group(1))
 
-    # --- KHR patterns ---
+    # KHR patterns
     m = re.search(r"៛\s*([\d,]+)", text)
     if m:
         khr = float(m.group(1).replace(",", ""))
@@ -281,16 +293,14 @@ def extract_group_payment(text: str) -> Optional[tuple]:
     if usd == 0 and khr == 0:
         return None
 
-    # --- Build a meaningful note ---
+    # Note extraction
     payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
-
     if not note:
         khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
         if khmer_payer:
             note = khmer_payer.group(1).strip()
-
     if not note:
         card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
         if card_match:
@@ -303,7 +313,6 @@ def extract_group_payment(text: str) -> Optional[tuple]:
                 pos_match = re.search(r"POS\s+ID:(\d+)", text, re.IGNORECASE)
                 if pos_match:
                     note = "POS: " + pos_match.group(1)
-
     if not note:
         note = text.split("\n")[0].strip()[:80]
 
@@ -314,7 +323,7 @@ def extract_group_payment(text: str) -> Optional[tuple]:
     return usd, khr, note
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle messages from monitored groups – silently record payments."""
+    """Silently record payments from monitored groups."""
     if not update.message or not update.message.text:
         return
     msg = update.message
@@ -332,6 +341,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     usd, khr, note = result
     today = datetime.date.today()
 
+    # Determine business tag for this group
+    business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
+
     data = load_data()
     entry = {
         "date": today.strftime("%Y-%m-%d"),
@@ -339,47 +351,102 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         "khr": khr,
         "note": note,
         "category": "other",
-        "business": GROUP_BUSINESS_TAG,
+        "business": business_tag,
         "source": f"group_{msg.chat.id}_msg{msg.message_id}"
     }
     data.append(entry)
     save_data(data)
-    logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id}")
+    logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id} (business: {business_tag})")
 
-# ---------- Group Command: /daily ----------
-async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /daily command inside a monitored group – show today's totals for this group."""
-    if not update.message or update.message.chat.id not in MONITORED_GROUP_IDS:
-        return
+# ---------- Helper for group period reports ----------
+def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
+    if today is None:
+        today = datetime.date.today()
+    if period == "daily":
+        return [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
+    elif period == "weekly":
+        week_start = today - datetime.timedelta(days=today.weekday())
+        week_dates = {(week_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
+        return [e for e in data if e["date"] in week_dates]
+    elif period == "monthly":
+        month_prefix = today.strftime("%Y-%m")
+        return [e for e in data if e["date"].startswith(month_prefix)]
+    elif period == "quarterly":
+        quarter = (today.month - 1) // 3 + 1
+        start_month = (quarter - 1) * 3 + 1
+        start_date = datetime.date(today.year, start_month, 1)
+        end_date = today
+        dates = set()
+        d = start_date
+        while d <= end_date:
+            dates.add(d.strftime("%Y-%m-%d"))
+            d += datetime.timedelta(days=1)
+        return [e for e in data if e["date"] in dates]
+    elif period == "yearly":
+        year_prefix = today.strftime("%Y")
+        return [e for e in data if e["date"].startswith(year_prefix)]
+    else:
+        return []
 
-    # Uncomment the next two lines to restrict to owner only
-    # if update.effective_user.id != OWNER_ID:
-    #     return
-
-    today = datetime.date.today()
-    date_str = today.strftime("%Y-%m-%d")
+def group_period_summary(chat_id: int, period: str, label: str, today: Optional[datetime.date] = None) -> str:
     data = load_data()
+    all_entries = get_entries_for_period(data, period, today)
+    # Filter for this group only
+    group_entries = [e for e in all_entries if e.get("source", "").startswith(f"group_{chat_id}_")]
+    if not group_entries:
+        return f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។"
 
-    group_id = update.message.chat.id
-    entries = [
-        e for e in data
-        if e["date"] == date_str and e.get("source", "").startswith(f"group_{group_id}_")
-    ]
-
-    if not entries:
-        await update.message.reply_text(f"គ្មានប្រតិបត្តិការថ្ងៃនេះសម្រាប់ក្រុមនេះទេ។")
-        return
-
-    total_usd = sum(e["usd"] for e in entries)
-    total_khr = sum(e["khr"] for e in entries)
-    count_usd = sum(1 for e in entries if e["usd"] > 0)
-    count_khr = sum(1 for e in entries if e["khr"] > 0)
-
-    text = (
-        f"📊 សរុបថ្ងៃនេះ ({date_str}) សម្រាប់ក្រុមនេះ៖\n"
+    total_usd = sum(e["usd"] for e in group_entries)
+    total_khr = sum(e["khr"] for e in group_entries)
+    count_usd = sum(1 for e in group_entries if e["usd"] > 0)
+    count_khr = sum(1 for e in group_entries if e["khr"] > 0)
+    return (
+        f"📊 សរុប {label} សម្រាប់ក្រុមនេះ៖\n"
         f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}\n"
         f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
     )
+
+# ---------- Group Commands ----------
+async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    today = datetime.date.today()
+    label = f"ថ្ងៃទី {today.strftime('%Y-%m-%d')}"
+    text = group_period_summary(update.message.chat.id, "daily", label, today)
+    await update.message.reply_text(text)
+
+async def group_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    today = datetime.date.today()
+    week_start = today - datetime.timedelta(days=today.weekday())
+    label = f"សប្ដាហ៍ ({week_start.strftime('%Y-%m-%d')} → {today.strftime('%Y-%m-%d')})"
+    text = group_period_summary(update.message.chat.id, "weekly", label, today)
+    await update.message.reply_text(text)
+
+async def group_monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    today = datetime.date.today()
+    label = f"ខែ {today.strftime('%Y-%m')}"
+    text = group_period_summary(update.message.chat.id, "monthly", label, today)
+    await update.message.reply_text(text)
+
+async def group_quarterly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    today = datetime.date.today()
+    quarter = (today.month - 1) // 3 + 1
+    label = f"ត្រីមាសទី {quarter} ឆ្នាំ {today.year}"
+    text = group_period_summary(update.message.chat.id, "quarterly", label, today)
+    await update.message.reply_text(text)
+
+async def group_yearly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    today = datetime.date.today()
+    label = f"ឆ្នាំ {today.year}"
+    text = group_period_summary(update.message.chat.id, "yearly", label, today)
     await update.message.reply_text(text)
 
 # ---------- Main private message handler ----------
@@ -446,7 +513,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=MAIN_KEYBOARD,
     )
 
-# ---------- Background PayWay sync thread ----------
+# ---------- Background PayWay sync ----------
 def sync_worker(bot_token: str) -> None:
     while True:
         try:
@@ -481,14 +548,18 @@ application.add_handler(CommandHandler("day", day_report))
 application.add_handler(CommandHandler("sync", manual_sync))
 application.add_handler(CommandHandler("sync_status", sync_status))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
-# Group monitoring handler (silent recording)
+# Group monitoring (silent)
 application.add_handler(MessageHandler(
     filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
     group_message_handler
 ))
-# Group command: /daily (only in monitored groups)
+# Group period commands
 application.add_handler(CommandHandler("daily", group_daily_command, filters=filters.ChatType.GROUPS))
-# Private chat handler (fallback)
+application.add_handler(CommandHandler("weekly", group_weekly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("monthly", group_monthly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("quarterly", group_quarterly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("yearly", group_yearly_command, filters=filters.ChatType.GROUPS))
+# Private chat fallback
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
