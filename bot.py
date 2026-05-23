@@ -20,6 +20,7 @@ def save_data(data):
         json.dump(data, f)
 
 def extract_amounts(text):
+    """Extract USD and KHR amounts from payment notification text."""
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
 
@@ -53,15 +54,12 @@ async def send_summary_by_date(update: Update, target_date):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
-    if text.startswith("Jul"):
-        date = "2025-" + datetime.datetime.strptime(text, "%b %d").strftime("%m-%d")
-        await send_summary_by_date(update, date)
-        return
-
+    # Handle back button
     if text == "⬅ ត្រឡប់ក្រោយ":
         await show_menu(update, context)
         return
 
+    # Extract amounts from payment notification
     usd, khr = extract_amounts(text)
     if usd or khr:
         data = load_data()
@@ -73,6 +71,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await update.message.reply_text("✅ Payment recorded!")
         return
+
+    # If no amount found and not a known command, optionally ignore
+    # (Do nothing – avoid spamming user)
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -86,6 +87,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, context)
 
+# ---------- Flask Web App for Health Check & Webhook ----------
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is missing!")
@@ -94,6 +96,7 @@ app = Flask(__name__)
 bot = Bot(token=BOT_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
 
+# Register handlers
 dispatcher.add_handler(CommandHandler("menu", show_menu))
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
@@ -104,6 +107,10 @@ def webhook():
     dispatcher.process_update(update)
     return 'OK'
 
+@app.route('/')
+def health_check():
+    return "Bot is running"
+
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', '5000'))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
