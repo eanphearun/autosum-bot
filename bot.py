@@ -4,8 +4,11 @@ import datetime
 import json
 import re
 import logging
-from typing import List, Dict, Any
+import time
+import threading
+from typing import List, Dict, Any, Optional, Set
 
+import requests
 from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -16,20 +19,41 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.constants import ChatType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Config ----------
+# ---------- Configuration from environment ----------
 DATA_FILE = "income.json"
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))   # set your Telegram user ID
+SYNC_STATE_FILE = "sync_state.json"
 
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+
+# PayWay (ABA) API credentials – leave empty if not using API sync
+PAYWAY_MERCHANT_ID = os.environ.get("PAYWAY_MERCHANT_ID", "")
+PAYWAY_API_KEY = os.environ.get("PAYWAY_API_KEY", "")
+PAYWAY_BASE_URL = os.environ.get("PAYWAY_BASE_URL", "https://www.payway.com.kh/api/v1")
+PAYWAY_BUSINESS = os.environ.get("PAYWAY_BUSINESS", "birdnest")
+SYNC_INTERVAL_MINUTES = int(os.environ.get("SYNC_INTERVAL_MINUTES", "5"))
+
+# Group monitoring – list of group chat IDs to watch
+MONITORED_GROUP_IDS = [
+    int(gid.strip())
+    for gid in os.environ.get("MONITORED_GROUP_IDS", "").split(",")
+    if gid.strip()
+]
+GROUP_BUSINESS_TAG = os.environ.get("GROUP_BUSINESS_TAG", "group_payments")
+
+# In‑memory set to avoid duplicate processing of the same group message
+processed_group_messages: Set[int] = set()
+
+# Categories
 CATEGORIES = {
     "product": "🛒 ផលិតផល",
     "delivery": "🚚 ដឹកជញ្ជូន",
     "other": "💸 ផ្សេងៗ"
 }
-CATEGORY_EMOJI = {v: k for k, v in CATEGORIES.items()}   # reverse map
 
 # ---------- Data helpers ----------
 def load_data() -> List[Dict[str, Any]]:
@@ -42,12 +66,22 @@ def save_data(data: List[Dict[str, Any]]) -> None:
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_sync_state() -> Dict[str, Any]:
+    if os.path.exists(SYNC_STATE_FILE):
+        with open(SYNC_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"last_sync": None, "imported_ids": []}
+
+def save_sync_state(state: Dict[str, Any]) -> None:
+    with open(SYNC_STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
 def extract_amounts(text: str):
+    """Extract USD and KHR from a manually typed message."""
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
     khr = int(khr_match.group(1).replace(",", "")) if khr_match else 0
     usd = float(usd_match.group(1)) if usd_match else 0.0
-    # extract note (everything except the amount parts)
     note = text
     for pat in [r"\$\d+\.?\d*", r"ចំនួន\s*[\d,]+\s*រៀល"]:
         note = re.sub(pat, "", note)
@@ -61,11 +95,10 @@ def summarise(entries: list, label: str) -> str:
     total_khr = sum(e["khr"] for e in entries)
     count_usd = sum(1 for e in entries if e["usd"] > 0)
     count_khr = sum(1 for e in entries if e["khr"] > 0)
-    # category breakdown
     cat_summary = {}
     for e in entries:
         cat = e.get("category", "other")
-        cat_summary[cat] = cat_summary.get(cat, 0) + e.get("usd",0) + e.get("khr",0)/4000  # approximate usd equivalent
+        cat_summary[cat] = cat_summary.get(cat, 0) + e.get("usd",0) + e.get("khr",0)/4000
     lines = [
         f"សរុបប្រតិបត្តិការ {label}",
         f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}",
@@ -88,7 +121,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- Handlers ----------
+# ---------- Handlers (private chat) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 សូមស្វាគមន៍! ជ្រើសរើសរបាយការណ៍ ឬផ្ញើការទូទាត់។",
@@ -121,26 +154,215 @@ async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("សូមប្រើទម្រង់ `/day 2026-05-20`")
 
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inline button to set category for the last entry."""
     query = update.callback_query
     await query.answer()
     data = load_data()
     if not data:
         await query.edit_message_text("មិនមានធាតុថ្មីៗទេ។")
         return
-    cat_key = query.data.split("_")[1]   # cat_product, cat_delivery, cat_other
+    cat_key = query.data.split("_")[1]
     data[-1]["category"] = cat_key
     save_data(data)
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
 
+# ---------- PayWay Sync (only works if credentials are provided) ----------
+def fetch_payway_transactions() -> List[Dict[str, Any]]:
+    if not PAYWAY_MERCHANT_ID or not PAYWAY_API_KEY:
+        return []
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    url = f"{PAYWAY_BASE_URL}/transactions"
+    headers = {
+        "Authorization": f"Bearer {PAYWAY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    params = {
+        "merchant_id": PAYWAY_MERCHANT_ID,
+        "start_date": today,
+        "end_date": today,
+        "status": "approved"
+    }
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("data", data.get("transactions", []))
+    except Exception as e:
+        logger.error(f"PayWay fetch error: {e}")
+        return []
+
+def import_payway_transaction(txn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    state = load_sync_state()
+    txn_id = str(txn.get("tran_id", ""))
+    if not txn_id or txn_id in state["imported_ids"]:
+        return None
+    amount = float(txn.get("amount", 0))
+    currency = txn.get("currency", "").upper()
+    description = txn.get("description", "") or txn.get("note", "")
+    entry = {
+        "date": txn.get("payment_date", datetime.date.today().strftime("%Y-%m-%d")),
+        "usd": amount if currency == "USD" else 0.0,
+        "khr": int(amount) if currency == "KHR" else 0,
+        "note": description,
+        "category": "other",
+        "business": PAYWAY_BUSINESS,
+        "tran_id": txn_id
+    }
+    return entry
+
+def sync_payway_transactions() -> int:
+    data = load_data()
+    state = load_sync_state()
+    imported_ids = set(state.get("imported_ids", []))
+    transactions = fetch_payway_transactions()
+    added = 0
+    for txn in transactions:
+        entry = import_payway_transaction(txn)
+        if entry is None:
+            continue
+        data.append(entry)
+        imported_ids.add(entry["tran_id"])
+        added += 1
+    if added > 0:
+        save_data(data)
+        state["imported_ids"] = list(imported_ids)
+        state["last_sync"] = datetime.datetime.now().isoformat()
+        save_sync_state(state)
+    return added
+
+async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text("⏳ កំពុងទាញយកទិន្នន័យពី PayWay...")
+    added = sync_payway_transactions()
+    if added > 0:
+        await update.message.reply_text(f"✅ បានបន្ថែម {added} ប្រតិបត្តិការថ្មី។")
+    else:
+        await update.message.reply_text("ℹ️ មិនមានប្រតិបត្តិការថ្មីទេ។")
+
+async def sync_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    state = load_sync_state()
+    last_sync = state.get("last_sync")
+    if last_sync:
+        msg = f"សមកាលកម្មចុងក្រោយ: {last_sync}"
+    else:
+        msg = "មិនទាន់បានសមកាលកម្មនៅឡើយទេ។"
+    await update.message.reply_text(msg)
+
+# ---------- Group Payment Monitoring ----------
+def extract_group_payment(text: str) -> Optional[tuple]:
+    """
+    Try to extract (usd, khr, note) from bank/payway/ACLEDA notification messages.
+    Returns None if it doesn't look like a payment notification.
+    """
+    usd = 0.0
+    khr = 0.0
+    note = ""
+
+    # --- USD patterns ---
+    # Standard $12.34
+    m = re.search(r"\$(\d+\.?\d*)", text)
+    if m:
+        usd = float(m.group(1))
+
+    # ACLEDA / other bank: "SALE 30.00 USD"
+    m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
+    if m:
+        usd = float(m.group(1))
+
+    # --- KHR patterns ---
+    # ៛100 or ៛ 1,000
+    m = re.search(r"៛\s*([\d,]+)", text)
+    if m:
+        khr = float(m.group(1).replace(",", ""))
+    else:
+        # "ចំនួន 50,000 រៀល"
+        m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
+        if m:
+            khr = float(m.group(1).replace(",", ""))
+
+    if usd == 0 and khr == 0:
+        return None
+
+    # --- Build a meaningful note ---
+    # 1. ABA PayWay: "paid by <Name>"
+    payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
+    if payer_match:
+        note = payer_match.group(1).strip()
+
+    # 2. Khmer notifications: "ពី <Name>"
+    if not note:
+        khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
+        if khmer_payer:
+            note = khmer_payer.group(1).strip()
+
+    # 3. ACLEDA: card number
+    if not note:
+        card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
+        if card_match:
+            note = "Card: " + card_match.group(1)
+        else:
+            ref_match = re.search(r"Ref\.ID\s+(\d+)", text, re.IGNORECASE)
+            if ref_match:
+                note = "Ref: " + ref_match.group(1)
+            else:
+                pos_match = re.search(r"POS\s+ID:(\d+)", text, re.IGNORECASE)
+                if pos_match:
+                    note = "POS: " + pos_match.group(1)
+
+    # 4. Fallback: first line trimmed
+    if not note:
+        note = text.split("\n")[0].strip()[:80]
+
+    # Optionally append transaction ID if present (ABA PayWay)
+    trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
+    if trx_match:
+        note += f" (Trx: {trx_match.group(1)})"
+
+    return usd, khr, note
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle messages from monitored groups – silently record payments."""
+    if not update.message or not update.message.text:
+        return
+    msg = update.message
+    if msg.chat.id not in MONITORED_GROUP_IDS:
+        return
+
+    if msg.message_id in processed_group_messages:
+        return
+    processed_group_messages.add(msg.message_id)
+
+    result = extract_group_payment(msg.text)
+    if not result:
+        return
+
+    usd, khr, note = result
+    today = datetime.date.today()
+
+    data = load_data()
+    entry = {
+        "date": today.strftime("%Y-%m-%d"),
+        "usd": usd,
+        "khr": khr,
+        "note": note,
+        "category": "other",
+        "business": GROUP_BUSINESS_TAG,
+        "source": f"group_{msg.chat.id}_msg{msg.message_id}"
+    }
+    data.append(entry)
+    save_data(data)
+    logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id}")
+
+# ---------- Main private message handler ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if OWNER_ID and update.effective_user.id != OWNER_ID:
-        return   # ignore non-owners if OWNER_ID is set
+        return
     text = update.message.text.strip()
     today = datetime.date.today()
     data = load_data()
 
-    # ── Report buttons ───────────────────────────────────
     if text == "ប្រចាំថ្ងៃ":
         date_str = today.strftime("%Y-%m-%d")
         entries = [e for e in data if e["date"] == date_str]
@@ -161,7 +383,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(summarise(entries, f"ខែ {today.strftime('%Y-%m')}"), reply_markup=MAIN_KEYBOARD)
         return
 
-    # ── Category button ──────────────────────────────────
     if text == "📂 កំណត់ប្រភេទ":
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(CATEGORIES["product"], callback_data="cat_product")],
@@ -171,7 +392,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("ជ្រើសរើសប្រភេទសម្រាប់ធាតុចុងក្រោយ៖", reply_markup=keyboard)
         return
 
-    # ── Recording amounts ────────────────────────────────
     usd, khr, note = extract_amounts(text)
     if usd or khr:
         entry = {
@@ -179,7 +399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "usd": usd,
             "khr": khr,
             "note": note,
-            "category": "other"   # default category
+            "category": "other"
         }
         data.append(entry)
         save_data(data)
@@ -194,11 +414,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
         return
 
-    # ── Unknown input ────────────────────────────────────
     await update.message.reply_text(
         "❓ មិនយល់។ សូមប្រើប៊ូតុង ឬផ្ញើចំនួនទឹកប្រាក់។",
         reply_markup=MAIN_KEYBOARD,
     )
+
+# ---------- Background PayWay sync thread (runs only if credentials present) ----------
+def sync_worker(bot_token: str) -> None:
+    while True:
+        try:
+            if PAYWAY_MERCHANT_ID and PAYWAY_API_KEY:
+                count = sync_payway_transactions()
+                if count > 0 and OWNER_ID:
+                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    text = f"🤖 បានទាញយក {count} ប្រតិបត្តិការថ្មីពី PayWay ដោយស្វ័យប្រវត្តិ។"
+                    payload = {"chat_id": OWNER_ID, "text": text}
+                    try:
+                        requests.post(url, json=payload, timeout=10)
+                    except:
+                        pass
+                logger.info(f"PayWay sync completed. {count} new transactions added.")
+        except Exception as e:
+            logger.error(f"Sync worker error: {e}")
+        time.sleep(SYNC_INTERVAL_MINUTES * 60)
 
 # ---------- Build Application ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -213,7 +451,14 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("menu", show_menu))
 application.add_handler(CommandHandler("delete", delete_last))
 application.add_handler(CommandHandler("day", day_report))
+application.add_handler(CommandHandler("sync", manual_sync))
+application.add_handler(CommandHandler("sync_status", sync_status))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
+# Group monitoring handler (must be before the general private handler)
+application.add_handler(MessageHandler(
+    filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+    group_message_handler
+))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
@@ -239,6 +484,10 @@ def set_webhook():
     url = f"{base_url}/webhook"
     result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
+
+# Start PayWay sync thread (will do nothing if credentials missing)
+sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True)
+sync_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
