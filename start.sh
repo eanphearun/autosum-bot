@@ -1,2 +1,2 @@
 #!/bin/bash
-python3 bot.py
+gunicorn bot:flask_app
