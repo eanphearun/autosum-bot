@@ -32,7 +32,6 @@ def save_data(data: list) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def extract_amounts(text: str) -> tuple[float, int]:
-    """Return (usd, khr) parsed from a Telegram message."""
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
     khr = int(khr_match.group(1).replace(",", "")) if khr_match else 0
@@ -40,7 +39,6 @@ def extract_amounts(text: str) -> tuple[float, int]:
     return usd, khr
 
 def summarise(entries: list, label: str) -> str:
-    """Build a KHR/USD summary string from a list of entries."""
     total_usd = sum(e["usd"] for e in entries)
     total_khr = sum(e["khr"] for e in entries)
     count_usd = sum(1 for e in entries if e["usd"] > 0)
@@ -136,34 +134,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=MAIN_KEYBOARD,
     )
 
-# ---------- Lazy Application builder ----------
-_app = None
+# ---------- Build & initialize the Application once ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-def get_app() -> Application:
-    global _app
-    if _app is None:
-        _app = (
-            Application.builder()
-            .token(os.environ["BOT_TOKEN"])
-            .updater(None)              # we use webhooks, no polling
-            .build()
-        )
-        _app.add_handler(CommandHandler("start", start))
-        _app.add_handler(CommandHandler("menu", show_menu))
-        _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        # Initialize the Application (fetches bot info, etc.)
-        asyncio.run(_app.initialize())
-    return _app
+application = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .updater(None)          # we push updates via webhook
+    .build()
+)
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("menu", show_menu))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# Create a persistent event loop and initialize the app immediately
+LOOP = asyncio.new_event_loop()
+LOOP.run_until_complete(application.initialize())
 
 # ---------- Flask webhook ----------
 flask_app = Flask(__name__)
 
 @flask_app.post("/webhook")
 def webhook():
-    app = get_app()
     payload = request.get_json(force=True)
-    update = Update.de_json(payload, app.bot)
-    asyncio.run(app.process_update(update))
+    update = Update.de_json(payload, application.bot)
+    # Process on the persistent loop (keeps bot session alive)
+    LOOP.run_until_complete(application.process_update(update))
     return "OK"
 
 @flask_app.get("/")
@@ -172,13 +168,12 @@ def health():
 
 @flask_app.get("/set_webhook")
 def set_webhook():
-    app = get_app()
     base_url = os.environ.get("WEBHOOK_URL", request.host_url.rstrip("/"))
     url = f"{base_url}/webhook"
-    result = asyncio.run(app.bot.set_webhook(url))
+    result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
 
-# ---------- Main (for local dev / gunicorn entry) ----------
+# ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
