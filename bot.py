@@ -106,8 +106,12 @@ if ALLOWED_GROUP_SENDERS:
             logger.warning(f"Invalid user ID in ALLOWED_GROUP_SENDERS: {uid_str}")
 
 # Announcement settings
-ANNOUNCE_GROUP_ID = int(os.environ.get("ANNOUNCE_GROUP_ID", "0"))
-ANNOUNCE_TIME = os.environ.get("ANNOUNCE_TIME", "21:00")   # HH:MM Cambodia time
+try:
+    ANNOUNCE_GROUP_ID = int(os.environ.get("ANNOUNCE_GROUP_ID", "0") or "0")
+except (ValueError, TypeError):
+    ANNOUNCE_GROUP_ID = 0
+
+ANNOUNCE_TIME = os.environ.get("ANNOUNCE_TIME", "") or "21:00"
 
 # Google Sheets
 GSPREAD_CREDENTIALS_JSON = os.environ.get("GSPREAD_CREDENTIALS_JSON", "")
