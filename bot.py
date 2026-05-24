@@ -446,7 +446,13 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
                 if pos_match:
                     note = "POS: " + pos_match.group(1)
     if not note:
-        note = text.split("\n")[0].strip()[:80]
+        first_line = text.split("\n")[0].strip()
+        # Remove any USD or KHR amount and extra whitespace
+        first_line = re.sub(r"\$?\d+\.?\d*", "", first_line)   # remove numbers and optional $
+        first_line = re.sub(r"៛\s*[\d,]+", "", first_line)     # remove KHR symbol + number
+        first_line = re.sub(r"ចំនួន\s*[\d,]+\s*រៀល", "", first_line)  # Khmer format
+        first_line = first_line.strip()
+        note = first_line[:80] if first_line else text.split("\n")[0].strip()[:80]
 
     trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
     if trx_match:
@@ -538,9 +544,24 @@ def get_entries_for_period(data: List[Dict], period: str, today: Optional[dateti
 def group_period_summary(chat_id: int, period: str, label: str, today: Optional[datetime.date] = None) -> str:
     data = load_data()
     all_entries = get_entries_for_period(data, period, today)
-    group_entries = [e for e in all_entries if e.get("source", "").startswith(f"group_{chat_id}_")]
+
+    # Get the business tag assigned to this group (from GROUP_BUSINESS_MAP or fallback)
+    group_tag = group_business_map.get(chat_id, GROUP_BUSINESS_TAG)
+
+    # Filter entries that belong to this group:
+    # 1. Entries with a source that starts with "group_{chat_id}_"
+    # 2. (After rebuild) Entries without a source but with the matching business tag
+    group_entries = []
+    for e in all_entries:
+        src = e.get("source", "")
+        if src.startswith(f"group_{chat_id}_"):
+            group_entries.append(e)
+        elif not src and e.get("business") == group_tag:
+            group_entries.append(e)
+
     if not group_entries:
         return f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។"
+
     total_usd = sum(e["usd"] for e in group_entries)
     total_khr = sum(e["khr"] for e in group_entries)
     count_usd = sum(1 for e in group_entries if e["usd"] > 0)
