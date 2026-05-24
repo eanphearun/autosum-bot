@@ -6,3 +6,5 @@ pytz
 gspread
 oauth2client
 PyOpenSSL
+matplotlib
+pillow
