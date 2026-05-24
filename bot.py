@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+clear_confirmation_token = None
 
 # ---------- Configuration ----------
 DATA_FILE = "income.json"
@@ -385,6 +386,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/sync_status – ស្ថានភាពសមកាលកម្ម\n"
         "/day YYYY-MM-DD – របាយការណ៍ថ្ងៃ\n"
         "/delete – លុបធាតុចុងក្រោយ\n"
+        "/clear_all – លុបទិន្នន័យទាំងអស់ (ត្រូវបញ្ជាក់ជាមួយ /confirm_clear)\n"
         "ប៊ូតុង៖ ប្រចាំថ្ងៃ, ប្រចាំសប្ដាហ៍, ប្រចាំខែ, កំណត់ប្រភេទ"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -402,6 +404,59 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     data[-1]["category"] = cat_key
     save_data(data)
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
+
+async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    global clear_confirmation_token
+    # Generate a random 6‑digit token
+    import random
+    token = str(random.randint(100000, 999999))
+    clear_confirmation_token = token
+    await update.message.reply_text(
+        f"⚠️ តើអ្នកពិតជាចង់លុបទិន្នន័យទាំងអស់មែនទេ?\n\n"
+        f"សូមវាយ `/confirm_clear {token}` ដើម្បីបញ្ជាក់។\n"
+        f"ប្រសិនបើអ្នកមិនចង់លុបទេ សូមមិនអើពើសារនេះ។"
+    )
+
+async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    global clear_confirmation_token
+    try:
+        token = context.args[0]
+    except:
+        await update.message.reply_text("សូមបញ្ចូលកូដបញ្ជាក់ពី `/confirm_clear <code>`")
+        return
+
+    if clear_confirmation_token is None or token != clear_confirmation_token:
+        await update.message.reply_text("កូដមិនត្រឹមត្រូវ ឬផុតកំណត់។ សូមព្យាយាមម្តងទៀតដោយប្រើ `/clear_all`")
+        return
+
+    # Clear Google Sheet
+    sheet = get_sheet()
+    if sheet:
+        try:
+            # Remove all rows except header (or clear entire sheet and re‑add header)
+            rows = sheet.get_all_values()
+            if len(rows) > 1:
+                # Delete all data rows (row 2 onward)
+                sheet.delete_rows(2, len(rows))
+            logger.info("Google Sheet cleared.")
+        except Exception as e:
+            logger.error(f"Failed to clear sheet: {e}")
+            await update.message.reply_text(f"❌ មានបញ្ហាក្នុងការលុប Sheet៖ {e}")
+            return
+
+    # Clear local data
+    save_data([])   # empty list -> income.json becomes []
+    # Clear sync state
+    save_sync_state({"last_sync": None, "imported_ids": []})
+    # Clear deleted stack
+    save_deleted([])
+
+    clear_confirmation_token = None
+    await update.message.reply_text("✅ ទិន្នន័យទាំងអស់ត្រូវបានលុបចោលទាំងស្រុង (Google Sheets + local)។")
 
 async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -1175,6 +1230,8 @@ application.add_handler(CommandHandler("summary", summary))
 application.add_handler(CommandHandler("bysender", bysender))
 application.add_handler(CommandHandler("duplicates", duplicates))
 application.add_handler(CommandHandler("announce", announce))
+application.add_handler(CommandHandler("clear_all", clear_all_command))
+application.add_handler(CommandHandler("confirm_clear", confirm_clear_command))
 application.add_handler(CommandHandler("add_manager", add_manager))
 application.add_handler(CommandHandler("remove_manager", remove_manager))
 application.add_handler(CommandHandler("permissions", permissions))
