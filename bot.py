@@ -1066,34 +1066,6 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg += "\n⚠️ មិនអាចលុបពី Google Sheets ទេ។"
     await update.message.reply_text(msg)
 
-# ---------- Email webhook ----------
-@flask_app.route("/email_webhook", methods=["POST"])
-def email_webhook():
-    secret = request.headers.get("X-Webhook-Secret", "")
-    if EMAIL_WEBHOOK_SECRET and secret != EMAIL_WEBHOOK_SECRET:
-        return "Unauthorized", 403
-    payload = request.get_json(force=True)
-    usd = float(payload.get("usd", 0))
-    khr = float(payload.get("khr", 0))
-    note = payload.get("note", "")
-    if usd == 0 and khr == 0:
-        return "No amount", 400
-    today = datetime.date.today()
-    entry = {
-        "date": today.strftime("%Y-%m-%d"),
-        "usd": usd,
-        "khr": khr,
-        "note": note,
-        "category": "other",
-        "business": PAYWAY_BUSINESS,
-        "tran_id": str(uuid.uuid4())
-    }
-    data = load_data()
-    data.append(entry)
-    save_data(data)
-    append_to_sheet(entry)
-    return "OK", 200
-
 # ---------- Background threads (PayWay sync + daily announcement) ----------
 def sync_worker(bot_token: str) -> None:
     while True:
@@ -1212,6 +1184,34 @@ def set_webhook():
     url = f"{base_url}/webhook"
     result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
+
+# ---------- Email webhook ----------
+@flask_app.route("/email_webhook", methods=["POST"])
+def email_webhook():
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if EMAIL_WEBHOOK_SECRET and secret != EMAIL_WEBHOOK_SECRET:
+        return "Unauthorized", 403
+    payload = request.get_json(force=True)
+    usd = float(payload.get("usd", 0))
+    khr = float(payload.get("khr", 0))
+    note = payload.get("note", "")
+    if usd == 0 and khr == 0:
+        return "No amount", 400
+    today = datetime.date.today()
+    entry = {
+        "date": today.strftime("%Y-%m-%d"),
+        "usd": usd,
+        "khr": khr,
+        "note": note,
+        "category": "other",
+        "business": PAYWAY_BUSINESS,
+        "tran_id": str(uuid.uuid4())
+    }
+    data = load_data()
+    data.append(entry)
+    save_data(data)
+    append_to_sheet(entry)
+    return "OK", 200
 
 # ---------- Rebuild local data from Google Sheets BEFORE starting ----------
 try:
