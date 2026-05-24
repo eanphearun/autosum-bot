@@ -389,6 +389,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
+async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != OWNER_ID:
+        return
+    data = load_data()
+    if not data:
+        await query.edit_message_text("មិនមានធាតុថ្មីៗទេ។")
+        return
+    cat_key = query.data.split("_")[1]   # cat_product, cat_delivery, cat_other
+    data[-1]["category"] = cat_key
+    save_data(data)
+    await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
+
 async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -683,9 +697,16 @@ def is_allowed_sender(user_id: int, chat_id: int) -> bool:
         return user_id in allowed_sender_ids
     if user_id == OWNER_ID:
         return True
-    if manager_group_map:
-        return user_id in manager_group_map and chat_id in manager_group_map[user_id]
-    return user_id in MANAGER_IDS
+    # Use the same persistent manager data as _can_use_group_commands
+    managers = load_managers()
+    mgrs = managers.get("managers", {})
+    group_map = managers.get("group_map", {})
+    if str(user_id) in mgrs:
+        groups = group_map.get(str(user_id))
+        if groups is None:
+            return True           # global manager
+        return chat_id in set(groups)
+    return False
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
