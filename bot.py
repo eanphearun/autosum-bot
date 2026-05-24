@@ -215,8 +215,11 @@ def rebuild_from_sheet() -> None:
             if not any(row):
                 continue
             date_val = row[0].strip()
-            usd_val = float(row[1]) if row[1] else 0.0
-            khr_val = float(row[2]) if row[2] else 0.0
+            # Strip $, commas, spaces before converting
+            usd_str = row[1].replace("$", "").replace(",", "").strip() if row[1] else "0"
+            khr_str = row[2].replace(",", "").strip() if row[2] else "0"
+            usd_val = float(usd_str) if usd_str else 0.0
+            khr_val = float(khr_str) if khr_str else 0.0
             category_val = row[3] if len(row) > 3 else "other"
             note_val = row[4] if len(row) > 4 else ""
             business_val = row[5] if len(row) > 5 else "manual"
@@ -385,6 +388,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "ប៊ូតុង៖ ប្រចាំថ្ងៃ, ប្រចាំសប្ដាហ៍, ប្រចាំខែ, កំណត់ប្រភេទ"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        date_str = context.args[0] if context.args else datetime.date.today().strftime("%Y-%m-%d")
+        data = load_data()
+        entries = [e for e in data if e["date"] == date_str]
+        await update.message.reply_text(summarise(entries, f"ថ្ងៃទី {date_str}"))
+    except Exception:
+        await update.message.reply_text("សូមប្រើទម្រង់ `/day 2026-05-20`")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
