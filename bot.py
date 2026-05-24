@@ -8,7 +8,11 @@ import time
 import threading
 from typing import List, Dict, Any, Optional, Set, Tuple
 
+import pytz
 import requests
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
 from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -24,13 +28,41 @@ from telegram.constants import ChatType
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Configuration from environment ----------
+# ---------- Configuration ----------
 DATA_FILE = "income.json"
 SYNC_STATE_FILE = "sync_state.json"
 
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
-# PayWay (ABA) API credentials – leave empty to disable
+# Manager IDs (comma-separated) who can view group reports (global fallback)
+MANAGER_IDS: Set[int] = set()
+_manager_str = os.environ.get("MANAGER_IDS", "")
+if _manager_str:
+    for uid_str in _manager_str.split(","):
+        try:
+            MANAGER_IDS.add(int(uid_str.strip()))
+        except ValueError:
+            logger.warning(f"Invalid manager ID: {uid_str}")
+
+# Manager group-specific assignments (format: "user_id1:group_id1,group_id2;user_id2:group_id3")
+manager_group_map: Dict[int, Set[int]] = {}
+_mgr_group_str = os.environ.get("MANAGER_GROUP_MAP", "")
+if _mgr_group_str:
+    for block in _mgr_group_str.split(";"):
+        parts = block.strip().split(":")
+        if len(parts) == 2:
+            try:
+                mgr_id = int(parts[0].strip())
+                group_ids = {
+                    int(gid.strip())
+                    for gid in parts[1].split(",")
+                    if gid.strip()
+                }
+                manager_group_map[mgr_id] = group_ids
+            except ValueError:
+                logger.warning(f"Invalid entry in MANAGER_GROUP_MAP: {block}")
+
+# PayWay (ABA) API – leave empty to disable
 PAYWAY_MERCHANT_ID = os.environ.get("PAYWAY_MERCHANT_ID", "")
 PAYWAY_API_KEY = os.environ.get("PAYWAY_API_KEY", "")
 PAYWAY_BASE_URL = os.environ.get("PAYWAY_BASE_URL", "https://www.payway.com.kh/api/v1")
@@ -45,7 +77,7 @@ MONITORED_GROUP_IDS = [
 ]
 GROUP_BUSINESS_TAG = os.environ.get("GROUP_BUSINESS_TAG", "group_payments")
 
-# Per‑group business tag mapping (format: "group_id1:tag1,group_id2:tag2")
+# Per‑group business tag mapping
 _group_map_str = os.environ.get("GROUP_BUSINESS_MAP", "")
 group_business_map: Dict[int, str] = {}
 if _group_map_str:
@@ -59,7 +91,22 @@ if _group_map_str:
             except ValueError:
                 logger.warning(f"Invalid group ID in GROUP_BUSINESS_MAP: {parts[0]}")
 
+# Security: allowed senders for group payment recording (optional)
+ALLOWED_GROUP_SENDERS = os.environ.get("ALLOWED_GROUP_SENDERS", "")
+allowed_sender_ids: Set[int] = set()
+if ALLOWED_GROUP_SENDERS:
+    for uid_str in ALLOWED_GROUP_SENDERS.split(","):
+        try:
+            allowed_sender_ids.add(int(uid_str.strip()))
+        except ValueError:
+            logger.warning(f"Invalid user ID in ALLOWED_GROUP_SENDERS: {uid_str}")
+# If not set, we'll decide in the handler based on manager assignments
+
 processed_group_messages: Set[int] = set()
+
+# Google Sheets config
+GSPREAD_CREDENTIALS_JSON = os.environ.get("GSPREAD_CREDENTIALS_JSON", "")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Bird Nest Income")
 
 # Categories
 CATEGORIES = {
@@ -67,6 +114,89 @@ CATEGORIES = {
     "delivery": "🚚 ដឹកជញ្ជូន",
     "other": "💸 ផ្សេងៗ"
 }
+
+# ---------- Google Sheets Helpers ----------
+def get_sheet():
+    if not GSPREAD_CREDENTIALS_JSON:
+        return None
+    creds_dict = json.loads(GSPREAD_CREDENTIALS_JSON)
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1
+
+def append_to_sheet(entry: dict) -> None:
+    sheet = get_sheet()
+    if not sheet:
+        return
+    try:
+        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            entry.get("date", ""),
+            entry.get("usd", 0),
+            entry.get("khr", 0),
+            CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ"),
+            entry.get("note", ""),
+            entry.get("business", ""),
+            now,
+            entry.get("tran_id", "")
+        ]
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        logger.info(f"Sheet export: {entry.get('usd',0)}$ / {entry.get('khr',0)}៛")
+    except Exception as e:
+        logger.error(f"Sheet export failed: {e}")
+
+def rebuild_from_sheet() -> None:
+    sheet = get_sheet()
+    if not sheet:
+        logger.info("Sheet not configured, skipping rebuild.")
+        return
+
+    try:
+        rows = sheet.get_all_values()
+        if len(rows) < 2:
+            logger.info("Sheet empty, nothing to rebuild.")
+            return
+
+        new_data = []
+        imported_ids = set()
+        for row in rows[1:]:
+            if not any(row):
+                continue
+            date_val = row[0].strip()
+            usd_val = float(row[1]) if row[1] else 0.0
+            khr_val = float(row[2]) if row[2] else 0.0
+            category_val = row[3] if len(row) > 3 else "other"
+            note_val = row[4] if len(row) > 4 else ""
+            business_val = row[5] if len(row) > 5 else "manual"
+            tran_id_val = row[7] if len(row) > 7 else ""
+
+            entry = {
+                "date": date_val,
+                "usd": usd_val,
+                "khr": khr_val,
+                "category": category_val.lower(),
+                "note": note_val,
+                "business": business_val,
+            }
+            if tran_id_val:
+                entry["tran_id"] = tran_id_val
+                imported_ids.add(tran_id_val)
+
+            new_data.append(entry)
+
+        with open(DATA_FILE, "w") as f:
+            json.dump(new_data, f, ensure_ascii=False, indent=2)
+
+        state = load_sync_state()
+        state["imported_ids"] = list(imported_ids)
+        state["last_sync"] = datetime.datetime.now().isoformat() if imported_ids else None
+        with open(SYNC_STATE_FILE, "w") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Rebuilt {len(new_data)} transactions from Google Sheets.")
+    except Exception as e:
+        logger.error(f"Rebuild failed: {e}")
 
 # ---------- Data helpers ----------
 def load_data() -> List[Dict[str, Any]]:
@@ -90,7 +220,6 @@ def save_sync_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def extract_amounts(text: str) -> Tuple[float, float, str]:
-    """Extract USD and KHR from manually typed messages."""
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
     khr = int(khr_match.group(1).replace(",", "")) if khr_match else 0
@@ -134,14 +263,18 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- Handlers (private chat) ----------
+# ---------- Handlers (private chat) – STRICTLY OWNER ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text(
         "👋 សូមស្វាគមន៍! ជ្រើសរើសរបាយការណ៍ ឬផ្ញើការទូទាត់។",
         reply_markup=MAIN_KEYBOARD,
     )
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text("📊 ម៉ឺនុយ", reply_markup=MAIN_KEYBOARD)
 
 async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,6 +305,8 @@ async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    if query.from_user.id != OWNER_ID:
+        return
     data = load_data()
     if not data:
         await query.edit_message_text("មិនមានធាតុថ្មីៗទេ។")
@@ -238,6 +373,7 @@ def sync_payway_transactions() -> int:
         data.append(entry)
         imported_ids.add(entry["tran_id"])
         added += 1
+        append_to_sheet(entry)
     if added > 0:
         save_data(data)
         state["imported_ids"] = list(imported_ids)
@@ -268,12 +404,10 @@ async def sync_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ---------- Group Payment Monitoring ----------
 def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
-    """Parse bank/payway/ACLEDA notification messages. Returns (usd, khr, note) or None."""
     usd = 0.0
     khr = 0.0
     note = ""
 
-    # USD patterns
     m = re.search(r"\$(\d+\.?\d*)", text)
     if m:
         usd = float(m.group(1))
@@ -281,7 +415,6 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
     if m:
         usd = float(m.group(1))
 
-    # KHR patterns
     m = re.search(r"៛\s*([\d,]+)", text)
     if m:
         khr = float(m.group(1).replace(",", ""))
@@ -293,7 +426,6 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
     if usd == 0 and khr == 0:
         return None
 
-    # Note extraction
     payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
@@ -322,12 +454,28 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
 
     return usd, khr, note
 
+def is_allowed_sender(user_id: int, chat_id: int) -> bool:
+    """Check if user is allowed to post payment notifications in the given group."""
+    if allowed_sender_ids:
+        # Explicit global whitelist overrides everything
+        return user_id in allowed_sender_ids
+    # If no explicit list, allow owner always
+    if user_id == OWNER_ID:
+        return True
+    # Allow managers who are assigned to this specific group (if assignments exist)
+    if manager_group_map:
+        return user_id in manager_group_map and chat_id in manager_group_map[user_id]
+    # Fallback: allow any manager (from MANAGER_IDS) if no group-specific map
+    return user_id in MANAGER_IDS
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Silently record payments from monitored groups."""
     if not update.message or not update.message.text:
         return
     msg = update.message
     if msg.chat.id not in MONITORED_GROUP_IDS:
+        return
+
+    if not is_allowed_sender(msg.from_user.id, msg.chat.id):
         return
 
     if msg.message_id in processed_group_messages:
@@ -340,8 +488,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     usd, khr, note = result
     today = datetime.date.today()
-
-    # Determine business tag for this group
     business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
 
     data = load_data()
@@ -356,9 +502,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     }
     data.append(entry)
     save_data(data)
+    append_to_sheet(entry)
     logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id} (business: {business_tag})")
 
-# ---------- Helper for group period reports ----------
+# ---------- Group period reports ----------
 def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
     if today is None:
         today = datetime.date.today()
@@ -391,11 +538,9 @@ def get_entries_for_period(data: List[Dict], period: str, today: Optional[dateti
 def group_period_summary(chat_id: int, period: str, label: str, today: Optional[datetime.date] = None) -> str:
     data = load_data()
     all_entries = get_entries_for_period(data, period, today)
-    # Filter for this group only
     group_entries = [e for e in all_entries if e.get("source", "").startswith(f"group_{chat_id}_")]
     if not group_entries:
         return f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។"
-
     total_usd = sum(e["usd"] for e in group_entries)
     total_khr = sum(e["khr"] for e in group_entries)
     count_usd = sum(1 for e in group_entries if e["usd"] > 0)
@@ -406,9 +551,20 @@ def group_period_summary(chat_id: int, period: str, label: str, today: Optional[
         f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
     )
 
-# ---------- Group Commands ----------
+# ---------- Group Commands (Owner + authorised managers) ----------
+def _can_use_group_commands(user_id: int, chat_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    if manager_group_map:
+        # Use group-specific assignments
+        return user_id in manager_group_map and chat_id in manager_group_map[user_id]
+    # Fallback: all MANAGER_IDS can access any group
+    return user_id in MANAGER_IDS
+
 async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
         return
     today = datetime.date.today()
     label = f"ថ្ងៃទី {today.strftime('%Y-%m-%d')}"
@@ -417,6 +573,8 @@ async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def group_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
         return
     today = datetime.date.today()
     week_start = today - datetime.timedelta(days=today.weekday())
@@ -427,6 +585,8 @@ async def group_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def group_monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
         return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
     today = datetime.date.today()
     label = f"ខែ {today.strftime('%Y-%m')}"
     text = group_period_summary(update.message.chat.id, "monthly", label, today)
@@ -434,6 +594,8 @@ async def group_monthly_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def group_quarterly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
         return
     today = datetime.date.today()
     quarter = (today.month - 1) // 3 + 1
@@ -444,14 +606,16 @@ async def group_quarterly_command(update: Update, context: ContextTypes.DEFAULT_
 async def group_yearly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
         return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
     today = datetime.date.today()
     label = f"ឆ្នាំ {today.year}"
     text = group_period_summary(update.message.chat.id, "yearly", label, today)
     await update.message.reply_text(text)
 
-# ---------- Main private message handler ----------
+# ---------- Main private message handler (owner only) ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if OWNER_ID and update.effective_user.id != OWNER_ID:
+    if update.effective_user.id != OWNER_ID:
         return
     text = update.message.text.strip()
     today = datetime.date.today()
@@ -493,10 +657,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "usd": usd,
             "khr": khr,
             "note": note,
-            "category": "other"
+            "category": "other",
+            "business": "manual"
         }
         data.append(entry)
         save_data(data)
+        append_to_sheet(entry)
         parts = []
         if usd:
             parts.append(f"${usd:.2f}")
@@ -527,7 +693,6 @@ def sync_worker(bot_token: str) -> None:
                         requests.post(url, json=payload, timeout=10)
                     except:
                         pass
-                logger.info(f"PayWay sync completed. {count} new transactions added.")
         except Exception as e:
             logger.error(f"Sync worker error: {e}")
         time.sleep(SYNC_INTERVAL_MINUTES * 60)
@@ -548,18 +713,15 @@ application.add_handler(CommandHandler("day", day_report))
 application.add_handler(CommandHandler("sync", manual_sync))
 application.add_handler(CommandHandler("sync_status", sync_status))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
-# Group monitoring (silent)
 application.add_handler(MessageHandler(
     filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
     group_message_handler
 ))
-# Group period commands
 application.add_handler(CommandHandler("daily", group_daily_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("weekly", group_weekly_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("monthly", group_monthly_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("quarterly", group_quarterly_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("yearly", group_yearly_command, filters=filters.ChatType.GROUPS))
-# Private chat fallback
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
@@ -586,7 +748,10 @@ def set_webhook():
     result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
 
-# Start PayWay sync thread (does nothing if credentials empty)
+# ---------- Rebuild local data from Google Sheets BEFORE starting ----------
+rebuild_from_sheet()
+
+# Start PayWay sync thread
 sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True)
 sync_thread.start()
 
