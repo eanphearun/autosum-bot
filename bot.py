@@ -742,7 +742,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if trx_id_match:
             trx_id = trx_id_match.group(1)
             if trx_id in SEEN_TRX_IDS:
-                await update.message.reply_text("⏭ ប្រតិបត្តិការនេះមានរួចហើយ (Trx. ID ដូចគ្នា) មិនកត់ត្រាទេ។")
+                await update.message.reply_text("⏭ ប្រតិបត្តិការនេះបានកត់ត្រារួចហើយ (Trx. ID ដូចគ្នា)។")
                 return
             SEEN_TRX_IDS.add(trx_id)
         
@@ -978,7 +978,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not result:
         return
     usd, khr, note = result
-        # Prevent duplicates based on PayWay transaction ID (if present)
+    # Prevent duplicates based on PayWay transaction ID (if present)
     trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", note)
     if trx_id_match:
         trx_id = trx_id_match.group(1)
@@ -1498,8 +1498,8 @@ async def duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
-    if ANNOUNCE_GROUP_ID == 0:
-        await update.message.reply_text("ANNOUNCE_GROUP_ID មិនបានកំណត់ទេ។")
+    if not ANNOUNCE_GROUP_IDS:
+        await update.message.reply_text("ANNOUNCE_GROUP_IDS មិនបានកំណត់ទេ។")
         return
     today = datetime.date.today()
     data = load_data()
