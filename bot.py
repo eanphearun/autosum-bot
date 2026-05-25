@@ -299,6 +299,16 @@ def rebuild_from_sheet() -> None:
     except Exception as e:
         logger.error(f"Rebuild failed: {e}")
 
+def seed_seen_trx_ids() -> None:
+    """Load all previously seen PayWay Trx. IDs from income.json."""
+    data = load_data()
+    for entry in data:
+        note = entry.get("note", "")
+        # Match both formats (the one appended by group capture, and the original PayWay format)
+        m = re.search(r"Trx:\s*(\d+)", note) or re.search(r"Trx\.\s*ID:\s*(\d+)", note)
+        if m:
+            SEEN_TRX_IDS.add(m.group(1))
+
 # ---------- Data helpers ----------
 def load_data() -> List[Dict[str, Any]]:
     if os.path.exists(DATA_FILE):
@@ -738,7 +748,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Manual entry with lock check
     usd, khr, note = extract_amounts(text)
     if usd or khr:
-        trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", note)
+                # Use original message text for Trx. ID, not the trimmed note
+        trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text)
         if trx_id_match:
             trx_id = trx_id_match.group(1)
             if trx_id in SEEN_TRX_IDS:
@@ -979,7 +990,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     usd, khr, note = result
     # Prevent duplicates based on PayWay transaction ID (if present)
-    trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", note)
+    trx_id_match = re.search(r"Trx:\s*(\d+)", note)
     if trx_id_match:
         trx_id = trx_id_match.group(1)
         if trx_id in SEEN_TRX_IDS:
@@ -1799,6 +1810,9 @@ try:
     rebuild_from_sheet()
 except Exception as e:
     logger.warning(f"Rebuild skipped due to error: {e}")
+
+
+seed_seen_trx_ids()
 
 sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True)
 sync_thread.start()
