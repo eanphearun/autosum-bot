@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------- Global flags ----------
 clear_confirmation_token = None
 MANUAL_LOCKED = False
+SEEN_TRX_IDS: Set[str] = set() 
 
 # ---------- Configuration ----------
 DATA_FILE = "income.json"
@@ -731,6 +732,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Manual entry with lock check
     usd, khr, note = extract_amounts(text)
     if usd or khr:
+        trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", note)
+        if trx_id_match:
+            trx_id = trx_id_match.group(1)
+            if trx_id in SEEN_TRX_IDS:
+                await update.message.reply_text("⏭ ប្រតិបត្តិការនេះមានរួចហើយ (Trx. ID ដូចគ្នា) មិនកត់ត្រាទេ។")
+                return
+            SEEN_TRX_IDS.add(trx_id)
+        
         if MANUAL_LOCKED:
             await update.message.reply_text("⛔ ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។ សូមទាក់ទងម្ចាស់។")
             return
@@ -963,6 +972,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not result:
         return
     usd, khr, note = result
+        # Prevent duplicates based on PayWay transaction ID (if present)
+    trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", note)
+    if trx_id_match:
+        trx_id = trx_id_match.group(1)
+        if trx_id in SEEN_TRX_IDS:
+            logger.info(f"Duplicate Trx. ID {trx_id} ignored.")
+            return
+        SEEN_TRX_IDS.add(trx_id)
     today = datetime.date.today()
     business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
     data = load_data()
@@ -1167,26 +1184,49 @@ async def group_duplicates_command(update: Update, context: ContextTypes.DEFAULT
         return
     if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
         return
+
     data = load_data()
+    total = len(data)
     group_id = update.message.chat.id
     group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
-    entries = [e for e in data if e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)]
+
+    # Keep only entries belonging to this group
+    group_entries = [
+        (i, e) for i, e in enumerate(data)
+        if e.get("source", "").startswith(f"group_{group_id}_")
+        or (not e.get("source") and e.get("business") == group_tag)
+    ]
+
+    if not group_entries:
+        await update.message.reply_text("មិនមានទិន្នន័យសម្រាប់ក្រុមនេះទេ។")
+        return
+
     dups = []
-    for i in range(len(entries)):
-        for j in range(i+1, len(entries)):
-            e1 = entries[i]
-            e2 = entries[j]
+    # Compare all pairs within group entries
+    for a in range(len(group_entries)):
+        idx_a, e1 = group_entries[a]
+        for b in range(a + 1, len(group_entries)):
+            idx_b, e2 = group_entries[b]
             if e1["date"] == e2["date"] and e1["usd"] == e2["usd"] and e1["khr"] == e2["khr"]:
-                n1 = (e1.get("note","") or "").strip()
-                n2 = (e2.get("note","") or "").strip()
+                n1 = (e1.get("note", "") or "").strip()
+                n2 = (e2.get("note", "") or "").strip()
                 if n1.split()[0].lower() == n2.split()[0].lower() if n1 and n2 else (not n1 and not n2):
-                    dups.append((i+1, j+1, e1, e2))
+                    # Convert absolute indices to /delete_index compatible (1 = most recent)
+                    idx1 = total - idx_a
+                    idx2 = total - idx_b
+                    dups.append((idx1, idx2, e1, e2))
+
     if not dups:
         await update.message.reply_text("មិនមានធាតុស្ទួនក្នុងក្រុមនេះទេ។")
         return
+
     lines = ["🔍 ធាតុស្ទួនក្នុងក្រុមនេះ៖"]
     for idx1, idx2, e1, e2 in dups[:5]:
-        lines.append(f"#{idx1} & #{idx2}: {e1['date']} ${e1['usd']} / {e1['khr']}៛")
+        lines.append(
+            f"#{idx1} & #{idx2}: {e1['date']} ${e1['usd']} / {e1['khr']}៛ "
+            f"({e1.get('note','')[:30]} / {e2.get('note','')[:30]})"
+        )
+    lines.append("សរុប /delete_index <លេខ> ដើម្បីលុប (យកលេខតូច)។")
     await update.message.reply_text("\n".join(lines))
 
 async def group_edit_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1424,25 +1464,29 @@ async def duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.effective_user.id != OWNER_ID:
         return
     data = load_data()
+    total = len(data)
     dups = []
-    for i in range(len(data)):
-        for j in range(i+1, len(data)):
+    for i in range(total):
+        for j in range(i+1, total):
             e1 = data[i]
             e2 = data[j]
             if e1["date"] == e2["date"] and e1["usd"] == e2["usd"] and e1["khr"] == e2["khr"]:
-                n1 = e1.get("note", "").strip()
-                n2 = e2.get("note", "").strip()
+                n1 = (e1.get("note","") or "").strip()
+                n2 = (e2.get("note","") or "").strip()
                 if n1.split()[0].lower() == n2.split()[0].lower() if n1 and n2 else (not n1 and not n2):
-                    dups.append((i+1, j+1, e1, e2))
+                    # Convert to /delete_index‑compatible indices (1 = most recent)
+                    idx1 = total - i
+                    idx2 = total - j
+                    dups.append((idx1, idx2, e1, e2))
     if not dups:
         await update.message.reply_text("មិនមានធាតុស្ទួនទេ។")
         return
     lines = ["🔍 ធាតុស្ទួនដែលអាចមាន៖"]
     for idx1, idx2, e1, e2 in dups[:10]:
         lines.append(
-            f"#{idx1} & #{idx2}: {e1['date']} ${e1['usd']} / {e1['khr']}៛ ({e1.get('note','')} / {e2.get('note','')})"
+            f"#{idx1} & #{idx2}: {e1['date']} ${e1['usd']} / {e1['khr']}៛ ({e1.get('note','')[:30]} / {e2.get('note','')[:30]})"
         )
-    lines.append("សរុប /delete_index <លេខ> ដើម្បីលុបធាតុដែលស្ទួន។")
+    lines.append("សរុប /delete_index <លេខ> ដើម្បីលុបធាតុដែលស្ទួន (យកលេខតូច)។")
     await update.message.reply_text("\n".join(lines))
 
 async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
