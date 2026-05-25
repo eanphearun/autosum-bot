@@ -7,13 +7,18 @@ import logging
 import time
 import threading
 import uuid
+import csv
 import io
+import statistics
+from collections import defaultdict
 from typing import List, Dict, Any, Optional, Set, Tuple
 
+import random
 import pytz
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from gspread.exceptions import SpreadsheetNotFound
 
 from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -33,13 +38,17 @@ import matplotlib.pyplot as plt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------- Global flags ----------
 clear_confirmation_token = None
+MANUAL_LOCKED = False
 
 # ---------- Configuration ----------
 DATA_FILE = "income.json"
 SYNC_STATE_FILE = "sync_state.json"
 MANAGERS_FILE = "managers.json"
-DELETED_FILE = "deleted.json"   # store recently deleted entries for undo
+DELETED_FILE = "deleted.json"
+REMINDER_FILE = "reminder.txt"
 
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
@@ -113,6 +122,8 @@ except (ValueError, TypeError):
     ANNOUNCE_GROUP_ID = 0
 
 ANNOUNCE_TIME = os.environ.get("ANNOUNCE_TIME", "") or "21:00"
+REMINDER_TIME = os.environ.get("REMINDER_TIME", "") or None
+BUSINESS_SHEET_MAP = os.environ.get("BUSINESS_SHEET_MAP", "")
 
 # Google Sheets
 GSPREAD_CREDENTIALS_JSON = os.environ.get("GSPREAD_CREDENTIALS_JSON", "")
@@ -158,8 +169,44 @@ def append_to_sheet(entry: dict) -> None:
         ]
         sheet.append_row(row, value_input_option="USER_ENTERED")
         logger.info(f"Sheet export: {entry.get('usd',0)}$ / {entry.get('khr',0)}៛ (ID: {entry['tran_id']})")
+        # Also write to the business‑specific sheet (outside the try block)
+        append_to_business_sheet(entry, row)
     except Exception as e:
         logger.error(f"Sheet export failed: {e}")
+
+def get_sheet_by_name(sheet_name: str):
+    if not GSPREAD_CREDENTIALS_JSON:
+        return None
+    creds_dict = json.loads(GSPREAD_CREDENTIALS_JSON)
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    try:
+        return client.open(sheet_name).sheet1
+    except SpreadsheetNotFound:
+        logger.info(f"Creating new sheet: {sheet_name}")
+        sheet = client.create(sheet_name)
+        return sheet.sheet1
+
+def get_business_sheet_name(business_tag: str) -> str:
+    if BUSINESS_SHEET_MAP:
+        for pair in BUSINESS_SHEET_MAP.split(","):
+            if ":" in pair:
+                tag, name = pair.split(":", 1)
+                if tag.strip() == business_tag:
+                    return name.strip()
+    return f"{SHEET_NAME} - {business_tag}"
+
+def append_to_business_sheet(entry: dict, row: list) -> None:
+    """Write a copy of the row to the business‑specific sheet (best‑effort)."""
+    try:
+        business = entry.get("business", "manual")
+        biz_sheet_name = get_business_sheet_name(business)
+        biz_sheet = get_sheet_by_name(biz_sheet_name)
+        if biz_sheet:
+            biz_sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"Business sheet write failed for {business}: {e}")
 
 def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
     if not tran_id:
@@ -181,7 +228,6 @@ def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
         return False
 
 def update_sheet_row_by_tran_id(tran_id: str, new_entry: dict) -> bool:
-    """Replace the row with given tran_id by a new row."""
     if not tran_id:
         return False
     sheet = get_sheet()
@@ -191,7 +237,6 @@ def update_sheet_row_by_tran_id(tran_id: str, new_entry: dict) -> bool:
         rows = sheet.get_all_values()
         for i, row in enumerate(rows):
             if len(row) > 7 and row[7] == tran_id:
-                # Update the cells (columns A-H). We can't update individual cells easily; delete and re-append.
                 sheet.delete_row(i + 1)
                 append_to_sheet(new_entry)
                 return True
@@ -216,7 +261,6 @@ def rebuild_from_sheet() -> None:
             if not any(row):
                 continue
             date_val = row[0].strip()
-            # Strip $, commas, spaces before converting
             usd_str = row[1].replace("$", "").replace(",", "").strip() if row[1] else "0"
             khr_str = row[2].replace(",", "").strip() if row[2] else "0"
             usd_val = float(usd_str) if usd_str else 0.0
@@ -273,7 +317,6 @@ def load_managers() -> Dict[str, Any]:
     if os.path.exists(MANAGERS_FILE):
         with open(MANAGERS_FILE, "r") as f:
             return json.load(f)
-    # Migrate from env vars
     data = {"managers": {}, "group_map": {}}
     if MANAGER_IDS:
         for uid in MANAGER_IDS:
@@ -302,14 +345,12 @@ def extract_amounts(text: str) -> Tuple[float, float, str]:
     usd_match = re.search(r"\$([\d\.]+)", text)
     khr = int(khr_match.group(1).replace(",", "")) if khr_match else 0
     usd = float(usd_match.group(1)) if usd_match else 0.0
-    # Also support ៛ symbol
     m = re.search(r"៛\s*([\d,]+)", text)
     if m:
         khr = float(m.group(1).replace(",", ""))
     note = text
     for pat in [r"\$\d+\.?\d*", r"៛\s*[\d,]+", r"ចំនួន\s*[\d,]+\s*រៀល"]:
         note = re.sub(pat, "", note)
-    # Try to extract payer name for note
     payer = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
     if payer:
         note = payer.group(1).strip()
@@ -340,6 +381,27 @@ def summarise(entries: list, label: str) -> str:
             if val:
                 lines.append(f"  {cat_label}: ${val:.2f}")
     return "\n".join(lines)
+
+def stats_data(entries: list) -> dict:
+    if not entries:
+        return {}
+    usd_amounts = [e["usd"] for e in entries if e["usd"] > 0]
+    khr_amounts = [e["khr"] for e in entries if e["khr"] > 0]
+    all_combined = [e["usd"] + e["khr"]/4000 for e in entries]
+    return {
+        "count": len(entries),
+        "total_usd": sum(usd_amounts),
+        "total_khr": sum(khr_amounts),
+        "avg_combined": statistics.mean(all_combined) if all_combined else 0,
+        "max_usd": max(usd_amounts) if usd_amounts else 0,
+        "min_usd": min(usd_amounts) if usd_amounts else 0,
+        "max_khr": max(khr_amounts) if khr_amounts else 0,
+        "min_khr": min(khr_amounts) if khr_amounts else 0,
+    }
+
+def search_entries(data: list, keyword: str) -> list:
+    kw = keyword.lower()
+    return [e for e in data if kw in (e.get("note", "") or "").lower()]
 
 # ---------- Keyboard ----------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -387,6 +449,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/day YYYY-MM-DD – របាយការណ៍ថ្ងៃ\n"
         "/delete – លុបធាតុចុងក្រោយ\n"
         "/clear_all – លុបទិន្នន័យទាំងអស់ (ត្រូវបញ្ជាក់ជាមួយ /confirm_clear)\n"
+        "/lock – ចាក់សោការបញ្ចូលដោយដៃ\n"
+        "/unlock – ដោះសោ\n"
+        "/remind HH:MM – កំណត់ពេលដាស់តឿនផ្ទាល់ខ្លួន\n"
+        "/export [start] [end] – ទាញយកជា CSV\n"
+        "/stats – ស្ថិតិថ្ងៃនេះ\n"
+        "/search <keyword> – ស្វែងរកតាមចំណាំ\n"
+        "/top [n] – ប្រតិបត្តិការធំជាងគេ\n"
+        "/range YYYY-MM-DD YYYY-MM-DD – របាយការណ៍ជួរកាលបរិច្ឆេទ\n"
         "ប៊ូតុង៖ ប្រចាំថ្ងៃ, ប្រចាំសប្ដាហ៍, ប្រចាំខែ, កំណត់ប្រភេទ"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -400,7 +470,7 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not data:
         await query.edit_message_text("មិនមានធាតុថ្មីៗទេ។")
         return
-    cat_key = query.data.split("_")[1]   # cat_product, cat_delivery, cat_other
+    cat_key = query.data.split("_")[1]
     data[-1]["category"] = cat_key
     save_data(data)
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
@@ -409,8 +479,6 @@ async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if update.effective_user.id != OWNER_ID:
         return
     global clear_confirmation_token
-    # Generate a random 6‑digit token
-    import random
     token = str(random.randint(100000, 999999))
     clear_confirmation_token = token
     await update.message.reply_text(
@@ -428,33 +496,22 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
     except:
         await update.message.reply_text("សូមបញ្ចូលកូដបញ្ជាក់ពី `/confirm_clear <code>`")
         return
-
     if clear_confirmation_token is None or token != clear_confirmation_token:
         await update.message.reply_text("កូដមិនត្រឹមត្រូវ ឬផុតកំណត់។ សូមព្យាយាមម្តងទៀតដោយប្រើ `/clear_all`")
         return
-
-    # Clear Google Sheet
     sheet = get_sheet()
     if sheet:
         try:
-            # Remove all rows except header (or clear entire sheet and re‑add header)
             rows = sheet.get_all_values()
             if len(rows) > 1:
-                # Delete all data rows (row 2 onward)
                 sheet.delete_rows(2, len(rows))
-            logger.info("Google Sheet cleared.")
         except Exception as e:
             logger.error(f"Failed to clear sheet: {e}")
             await update.message.reply_text(f"❌ មានបញ្ហាក្នុងការលុប Sheet៖ {e}")
             return
-
-    # Clear local data
-    save_data([])   # empty list -> income.json becomes []
-    # Clear sync state
+    save_data([])
     save_sync_state({"last_sync": None, "imported_ids": []})
-    # Clear deleted stack
     save_deleted([])
-
     clear_confirmation_token = None
     await update.message.reply_text("✅ ទិន្នន័យទាំងអស់ត្រូវបានលុបចោលទាំងស្រុង (Google Sheets + local)។")
 
@@ -469,11 +526,30 @@ async def day_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         await update.message.reply_text("សូមប្រើទម្រង់ `/day 2026-05-20`")
 
+async def range_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        start_str = context.args[0]
+        end_str = context.args[1]
+        start_date = datetime.date.fromisoformat(start_str)
+        end_date = datetime.date.fromisoformat(end_str)
+    except (IndexError, ValueError):
+        await update.message.reply_text("សូមប្រើទម្រង់ `/range 2026-05-01 2026-05-10`")
+        return
+    if start_date > end_date:
+        await update.message.reply_text("ថ្ងៃចាប់ផ្តើមត្រូវមុនថ្ងៃបញ្ចប់។")
+        return
+    delta = end_date - start_date
+    dates = [(start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(delta.days + 1)]
+    data = load_data()
+    entries = [e for e in data if e["date"] in dates]
+    label = f"ចាប់ពី {start_str} ដល់ {end_str}"
+    await update.message.reply_text(summarise(entries, label))
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
-    start_time = time.time()
-    # we can't easily get response time without async, just reply quickly
     await update.message.reply_text("🏓 Pong!")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -494,6 +570,81 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"SHEET_NAME: {SHEET_NAME}"
     )
     await update.message.reply_text(text)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    data = load_data()
+    if not data:
+        await update.message.reply_text("គ្មានទិន្នន័យ។")
+        return
+    today = datetime.date.today()
+    entries_today = [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
+    s = stats_data(entries_today)
+    if not s:
+        await update.message.reply_text("ថ្ងៃនេះមិនទាន់មានប្រតិបត្តិការទេ។")
+        return
+    msg = (
+        f"📊 ស្ថិតិថ្ងៃនេះ៖\n"
+        f"ចំនួនប្រតិបត្តិការ: {s['count']}\n"
+        f"សរុប USD: ${s['total_usd']:.2f}\n"
+        f"សរុប KHR: ៛{s['total_khr']:,}\n"
+        f"មធ្យម (USD equiv): ${s['avg_combined']:.2f}\n"
+        f"USD អតិបរមា: ${s['max_usd']:.2f}\n"
+        f"USD អប្បបរមា: ${s['min_usd']:.2f}\n"
+        f"KHR អតិបរមា: ៛{s['max_khr']:,}\n"
+        f"KHR អប្បបរមា: ៛{s['min_khr']:,}"
+    )
+    await update.message.reply_text(msg)
+
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("សូមប្រើ `/search <ពាក្យ>`")
+        return
+    keyword = " ".join(context.args)
+    data = load_data()
+    results = search_entries(data, keyword)
+    if not results:
+        await update.message.reply_text(f"រកមិនឃើញ '{keyword}' ទេ។")
+        return
+    lines = [f"🔍 លទ្ធផលសម្រាប់ '{keyword}'៖"]
+    for e in results[-10:]:
+        lines.append(f"{e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
+    await update.message.reply_text("\n".join(lines))
+
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        n = int(context.args[0]) if context.args else 5
+    except:
+        n = 5
+    data = load_data()
+    if not data:
+        await update.message.reply_text("គ្មានទិន្នន័យ។")
+        return
+    sorted_data = sorted(data, key=lambda e: e["usd"] + e["khr"]/4000, reverse=True)
+    top_entries = sorted_data[:n]
+    lines = [f"📈 ប្រតិបត្តិការធំជាងគេ {n}៖"]
+    for i, e in enumerate(top_entries, 1):
+        lines.append(f"{i}. {e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
+    await update.message.reply_text("\n".join(lines))
+
+async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    global MANUAL_LOCKED
+    MANUAL_LOCKED = True
+    await update.message.reply_text("🔒 ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។")
+
+async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    global MANUAL_LOCKED
+    MANUAL_LOCKED = False
+    await update.message.reply_text("🔓 ការកត់ត្រាដោយដៃត្រូវបានដោះសោ។")
 
 # ---------- Manager management commands ----------
 async def add_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -550,7 +701,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     today = datetime.date.today()
     data = load_data()
 
-    # Report buttons
+    # Report buttons (bypass lock)
     if text == "ប្រចាំថ្ងៃ":
         date_str = today.strftime("%Y-%m-%d")
         entries = [e for e in data if e["date"] == date_str]
@@ -577,9 +728,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("ជ្រើសរើសប្រភេទសម្រាប់ធាតុចុងក្រោយ៖", reply_markup=keyboard)
         return
 
-    # Manual entry
+    # Manual entry with lock check
     usd, khr, note = extract_amounts(text)
     if usd or khr:
+        if MANUAL_LOCKED:
+            await update.message.reply_text("⛔ ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។ សូមទាក់ទងម្ចាស់។")
+            return
         entry = {
             "date": today.strftime("%Y-%m-%d"),
             "usd": usd,
@@ -608,6 +762,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "វាយ /help សម្រាប់ជំនួយ។",
         reply_markup=MAIN_KEYBOARD,
     )
+
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        new_time = context.args[0]
+        if not re.match(r"^\d{2}:\d{2}$", new_time):
+            raise ValueError
+    except:
+        await update.message.reply_text("សូមប្រើ `/remind 21:00`")
+        return
+    with open(REMINDER_FILE, "w") as f:
+        f.write(new_time)
+    await update.message.reply_text(f"✅ ពេលដាស់តឿនត្រូវបានកំណត់ម៉ោង {new_time}")
+
+async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    data = load_data()
+    if not data:
+        await update.message.reply_text("គ្មានទិន្នន័យ។")
+        return
+    if len(context.args) == 2:
+        try:
+            start = datetime.date.fromisoformat(context.args[0])
+            end = datetime.date.fromisoformat(context.args[1])
+            data = [e for e in data if start <= datetime.date.fromisoformat(e["date"]) <= end]
+        except:
+            pass
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "USD", "KHR", "Category", "Note", "Business", "Timestamp", "Tran ID"])
+    for e in data:
+        writer.writerow([
+            e["date"], e["usd"], e["khr"], e.get("category","other"),
+            e.get("note",""), e.get("business",""), "", e.get("tran_id","")
+        ])
+    output.seek(0)
+    buf = io.BytesIO(output.getvalue().encode("utf-8"))
+    buf.name = f"export_{datetime.date.today().isoformat()}.csv"
+    await update.message.reply_document(document=buf)
 
 # ---------- PayWay Sync (optional) ----------
 def fetch_payway_transactions() -> List[Dict[str, Any]]:
@@ -700,14 +895,12 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
     usd = 0.0
     khr = 0.0
     note = ""
-
     m = re.search(r"\$(\d+\.?\d*)", text)
     if m:
         usd = float(m.group(1))
     m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
     if m:
         usd = float(m.group(1))
-
     m = re.search(r"៛\s*([\d,]+)", text)
     if m:
         khr = float(m.group(1).replace(",", ""))
@@ -715,10 +908,8 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
         m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
         if m:
             khr = float(m.group(1).replace(",", ""))
-
     if usd == 0 and khr == 0:
         return None
-
     payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
@@ -740,11 +931,9 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
                     note = "POS: " + pos_match.group(1)
     if not note:
         note = text.split("\n")[0].strip()[:80]
-
     trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
     if trx_match:
         note += f" (Trx: {trx_match.group(1)})"
-
     return usd, khr, note
 
 def is_allowed_sender(user_id: int, chat_id: int) -> bool:
@@ -752,14 +941,13 @@ def is_allowed_sender(user_id: int, chat_id: int) -> bool:
         return user_id in allowed_sender_ids
     if user_id == OWNER_ID:
         return True
-    # Use the same persistent manager data as _can_use_group_commands
     managers = load_managers()
     mgrs = managers.get("managers", {})
     group_map = managers.get("group_map", {})
     if str(user_id) in mgrs:
         groups = group_map.get(str(user_id))
         if groups is None:
-            return True           # global manager
+            return True
         return chat_id in set(groups)
     return False
 
@@ -771,7 +959,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if not is_allowed_sender(msg.from_user.id, msg.chat.id):
         return
-    # deduplicate (simple, in-memory)
     result = extract_group_payment(msg.text)
     if not result:
         return
@@ -794,7 +981,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     append_to_sheet(entry)
     logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id} (business: {business_tag})")
 
-# ---------- Group period reports (unchanged) ----------
+# ---------- Group period reports ----------
 def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
     if today is None:
         today = datetime.date.today()
@@ -854,10 +1041,11 @@ def _can_use_group_commands(user_id: int, chat_id: int) -> bool:
     if str(user_id) in managers.get("managers", {}):
         groups = managers.get("group_map", {}).get(str(user_id))
         if groups is None:
-            return True   # global manager
+            return True
         return chat_id in set(groups)
     return False
 
+# ---------- Existing group commands ----------
 async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
         return
@@ -905,7 +1093,227 @@ async def group_yearly_command(update: Update, context: ContextTypes.DEFAULT_TYP
     label = f"ឆ្នាំ {today.year}"
     await update.message.reply_text(group_period_summary(update.message.chat.id, "yearly", label, today))
 
-# ---------- New commands (compare, chart, summary, bysender, undo_delete, duplicates, edit_index, announce) ----------
+# ---------- New group commands (range, top, duplicates, edit_index, summary, bysender, compare) ----------
+async def group_range_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    try:
+        start_str = context.args[0]
+        end_str = context.args[1]
+        start_date = datetime.date.fromisoformat(start_str)
+        end_date = datetime.date.fromisoformat(end_str)
+    except (IndexError, ValueError):
+        await update.message.reply_text("សូមប្រើទម្រង់ `/range 2026-05-01 2026-05-10`")
+        return
+    if start_date > end_date:
+        await update.message.reply_text("ថ្ងៃចាប់ផ្តើមត្រូវមុនថ្ងៃបញ្ចប់។")
+        return
+    delta = end_date - start_date
+    dates = [(start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(delta.days + 1)]
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    entries = []
+    for e in data:
+        if e["date"] not in dates:
+            continue
+        src = e.get("source", "")
+        if src.startswith(f"group_{group_id}_"):
+            entries.append(e)
+        elif not src and e.get("business") == group_tag:
+            entries.append(e)
+    label = f"ចាប់ពី {start_str} ដល់ {end_str}"
+    if not entries:
+        await update.message.reply_text(f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។")
+        return
+    total_usd = sum(e["usd"] for e in entries)
+    total_khr = sum(e["khr"] for e in entries)
+    count_usd = sum(1 for e in entries if e["usd"] > 0)
+    count_khr = sum(1 for e in entries if e["khr"] > 0)
+    text = (
+        f"📊 សរុប {label} សម្រាប់ក្រុមនេះ៖\n"
+        f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}\n"
+        f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
+    )
+    await update.message.reply_text(text)
+
+async def group_top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    try:
+        n = int(context.args[0]) if context.args else 5
+    except:
+        n = 5
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    entries = [e for e in data if e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)]
+    if not entries:
+        await update.message.reply_text("គ្មានទិន្នន័យសម្រាប់ក្រុមនេះទេ។")
+        return
+    sorted_entries = sorted(entries, key=lambda e: e["usd"] + e["khr"]/4000, reverse=True)
+    top_entries = sorted_entries[:n]
+    lines = [f"📈 ប្រតិបត្តិការធំជាងគេ {n} សម្រាប់ក្រុមនេះ៖"]
+    for i, e in enumerate(top_entries, 1):
+        lines.append(f"{i}. {e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
+    await update.message.reply_text("\n".join(lines))
+
+async def group_duplicates_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    entries = [e for e in data if e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)]
+    dups = []
+    for i in range(len(entries)):
+        for j in range(i+1, len(entries)):
+            e1 = entries[i]
+            e2 = entries[j]
+            if e1["date"] == e2["date"] and e1["usd"] == e2["usd"] and e1["khr"] == e2["khr"]:
+                n1 = (e1.get("note","") or "").strip()
+                n2 = (e2.get("note","") or "").strip()
+                if n1.split()[0].lower() == n2.split()[0].lower() if n1 and n2 else (not n1 and not n2):
+                    dups.append((i+1, j+1, e1, e2))
+    if not dups:
+        await update.message.reply_text("មិនមានធាតុស្ទួនក្នុងក្រុមនេះទេ។")
+        return
+    lines = ["🔍 ធាតុស្ទួនក្នុងក្រុមនេះ៖"]
+    for idx1, idx2, e1, e2 in dups[:5]:
+        lines.append(f"#{idx1} & #{idx2}: {e1['date']} ${e1['usd']} / {e1['khr']}៛")
+    await update.message.reply_text("\n".join(lines))
+
+async def group_edit_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    try:
+        idx = int(context.args[0])
+    except:
+        await update.message.reply_text("សូមប្រើ `/edit_index <n> <amount> [note]`")
+        return
+    data = load_data()
+    if idx < 1 or idx > len(data):
+        await update.message.reply_text("លេខមិនត្រឹមត្រូវ។")
+        return
+    entry = data[len(data) - idx]
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    src = entry.get("source","")
+    if not (src.startswith(f"group_{group_id}_") or (not src and entry.get("business")==group_tag)):
+        await update.message.reply_text("ធាតុនេះមិនមែនជារបស់ក្រុមនេះទេ។")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("សូមបញ្ចូលចំនួនថ្មី។")
+        return
+    new_amount_str = context.args[1]
+    new_usd, new_khr, _ = extract_amounts(new_amount_str)
+    if new_usd == 0 and new_khr == 0:
+        await update.message.reply_text("ចំនួនមិនត្រឹមត្រូវ។")
+        return
+    old_usd = entry["usd"]
+    old_khr = entry["khr"]
+    entry["usd"] = new_usd
+    entry["khr"] = new_khr
+    if len(context.args) >= 3:
+        entry["note"] = " ".join(context.args[2:])
+    save_data(data)
+    update_sheet_row_by_tran_id(entry.get("tran_id"), entry)
+    await update.message.reply_text(
+        f"✅ បានកែប្រែធាតុលេខ {idx}: "
+        f"ពី ${old_usd:.2f} / ៛{old_khr:,} → ${new_usd:.2f} / ៛{new_khr:,} | {entry['note']}"
+    )
+
+async def group_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    today = datetime.date.today()
+    month_prefix = today.strftime("%Y-%m")
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    entries = [e for e in data if e["date"].startswith(month_prefix) and (
+        e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)
+    )]
+    if not entries:
+        await update.message.reply_text("គ្មានទិន្នន័យសម្រាប់ក្រុមនេះក្នុងខែនេះទេ។")
+        return
+    total_usd = sum(e["usd"] for e in entries)
+    total_khr = sum(e["khr"] for e in entries)
+    num = len(entries)
+    days = today.day
+    avg = total_usd / days if days else 0
+    await update.message.reply_text(
+        f"📊 សង្ខេបខែ {month_prefix} សម្រាប់ក្រុមនេះ៖\n"
+        f"ប្រតិបត្តិការ: {num}\n"
+        f"សរុប: ${total_usd:.2f} / ៛{total_khr:,}\n"
+        f"មធ្យមក្នុងមួយថ្ងៃ: ${avg:.2f}"
+    )
+
+async def group_bysender_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    period = "daily"
+    if context.args:
+        period = context.args[0].lower()
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    entries = get_entries_for_period(data, period)
+    group_entries = [e for e in entries if e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)]
+    sender_totals = defaultdict(float)
+    for e in group_entries:
+        payer = (e.get("note","") or "unknown").strip()
+        if not payer:
+            payer = "unknown"
+        sender_totals[payer] += e["usd"] + e["khr"]/4000
+    if not sender_totals:
+        await update.message.reply_text("គ្មានទិន្នន័យ។")
+        return
+    sorted_senders = sorted(sender_totals.items(), key=lambda x: x[1], reverse=True)
+    lines = [f"📊 អ្នកផ្ញើ ({period}) សម្រាប់ក្រុមនេះ៖"]
+    for sender, amt in sorted_senders[:10]:
+        lines.append(f"  {sender}: ${amt:.2f}")
+    await update.message.reply_text("\n".join(lines))
+
+async def group_compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+    data = load_data()
+    group_id = update.message.chat.id
+    group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+    today_entries = [e for e in data if e["date"] == today.strftime("%Y-%m-%d") and (
+        e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)
+    )]
+    yesterday_entries = [e for e in data if e["date"] == yesterday.strftime("%Y-%m-%d") and (
+        e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)
+    )]
+    total_today = sum(e["usd"] for e in today_entries)
+    total_yesterday = sum(e["usd"] for e in yesterday_entries)
+    change = "N/A" if total_yesterday == 0 else f"{(total_today - total_yesterday) / total_yesterday * 100:+.1f}%"
+    await update.message.reply_text(
+        f"📊 ប្រៀបធៀបថ្ងៃនេះ vs ម្សិលមិញ សម្រាប់ក្រុមនេះ៖\n"
+        f"ថ្ងៃនេះ: ${total_today:.2f}\n"
+        f"ម្សិលមិញ: ${total_yesterday:.2f}\n"
+        f"ផ្លាស់ប្តូរ: {change}"
+    )
+
+# ---------- Previous owner-only commands (compare, chart, summary, bysender, undo_delete, duplicates, announce, edit_index, recent, delete_index) ----------
 async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -938,7 +1346,6 @@ async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for d in days:
         entries = [e for e in data if e["date"] == d]
         totals.append(sum(e["usd"] for e in entries))
-    # Create bar chart
     plt.figure(figsize=(10, 5))
     plt.bar(days, totals, color='skyblue')
     plt.title("ប្រាក់ចំណូល ៧ថ្ងៃចុងក្រោយ (USD)")
@@ -980,7 +1387,6 @@ async def bysender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         period = context.args[0].lower()
     data = load_data()
     entries = get_entries_for_period(data, period)
-    # aggregate by note (payer name)
     sender_totals = {}
     for e in entries:
         payer = e.get("note", "unknown").strip()
@@ -1005,11 +1411,9 @@ async def undo_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     last_deleted = deleted.pop()
     save_deleted(deleted)
-    # Restore to data
     data = load_data()
     data.append(last_deleted)
     save_data(data)
-    # Restore to sheet
     append_to_sheet(last_deleted)
     await update.message.reply_text(
         f"✅ បានស្តារធាតុ: {last_deleted.get('note','')} | "
@@ -1020,14 +1424,12 @@ async def duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.effective_user.id != OWNER_ID:
         return
     data = load_data()
-    # Find potential duplicates: same date, same amount (usd and khr), similar note (first word match)
     dups = []
     for i in range(len(data)):
         for j in range(i+1, len(data)):
             e1 = data[i]
             e2 = data[j]
             if e1["date"] == e2["date"] and e1["usd"] == e2["usd"] and e1["khr"] == e2["khr"]:
-                # Check if notes share first word or both empty
                 n1 = e1.get("note", "").strip()
                 n2 = e2.get("note", "").strip()
                 if n1.split()[0].lower() == n2.split()[0].lower() if n1 and n2 else (not n1 and not n2):
@@ -1080,34 +1482,28 @@ async def edit_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if idx < 1 or idx > len(data):
         await update.message.reply_text("លេខមិនត្រឹមត្រូវ។")
         return
-    entry = data[len(data) - idx]   # idx=1 => last
-    # Extract new amount and optional note from remaining args
+    entry = data[len(data) - idx]
     if len(context.args) < 2:
         await update.message.reply_text("សូមបញ្ចូលចំនួនថ្មី។")
         return
     new_amount_str = context.args[1]
-    # Parse new amount: may be USD or KHR
     new_usd, new_khr, _ = extract_amounts(new_amount_str)
     if new_usd == 0 and new_khr == 0:
         await update.message.reply_text("ចំនួនមិនត្រឹមត្រូវ។")
         return
-    # Update entry
     old_usd = entry["usd"]
     old_khr = entry["khr"]
     entry["usd"] = new_usd
     entry["khr"] = new_khr
-    # Update note if provided
     if len(context.args) >= 3:
         entry["note"] = " ".join(context.args[2:])
     save_data(data)
-    # Update sheet
     update_sheet_row_by_tran_id(entry.get("tran_id"), entry)
     await update.message.reply_text(
         f"✅ បានកែប្រែធាតុលេខ {idx}: "
         f"ពី ${old_usd:.2f} / ៛{old_khr:,} → ${new_usd:.2f} / ៛{new_khr:,} | {entry['note']}"
     )
 
-# ---------- Recent entries & delete_index (two‑way deletion) ----------
 async def recent_entries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1143,11 +1539,9 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     entry_index = len(data) - idx
     entry = data.pop(entry_index)
     save_data(data)
-    # Save to deleted stack for undo
     deleted = load_deleted()
     deleted.append(entry)
     save_deleted(deleted)
-    # Delete from sheet
     sheet_deleted = delete_sheet_row_by_tran_id(entry.get("tran_id"))
     msg = f"🗑 បានលុបធាតុលេខ {idx}: {entry.get('note','')} | ${entry.get('usd',0):.2f} / ៛{entry.get('khr',0):,}"
     if sheet_deleted:
@@ -1156,7 +1550,7 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg += "\n⚠️ មិនអាចលុបពី Google Sheets ទេ។"
     await update.message.reply_text(msg)
 
-# ---------- Background threads (PayWay sync + daily announcement) ----------
+# ---------- Background threads ----------
 def sync_worker(bot_token: str) -> None:
     while True:
         try:
@@ -1175,7 +1569,6 @@ def sync_worker(bot_token: str) -> None:
         time.sleep(SYNC_INTERVAL_MINUTES * 60)
 
 def announcement_worker(bot_token: str) -> None:
-    """Check every minute and send daily summary to announce group at the set time."""
     last_sent_date = None
     while True:
         try:
@@ -1205,6 +1598,35 @@ def announcement_worker(bot_token: str) -> None:
             logger.error(f"Announcement worker error: {e}")
         time.sleep(60)
 
+def reminder_worker(bot_token: str) -> None:
+    last_sent_date = None
+    while True:
+        try:
+            if not os.path.exists(REMINDER_FILE):
+                time.sleep(60)
+                continue
+            with open(REMINDER_FILE, "r") as f:
+                rem_time = f.read().strip()
+            if not rem_time:
+                time.sleep(60)
+                continue
+            tz = pytz.timezone("Asia/Phnom_Penh")
+            now = datetime.datetime.now(tz)
+            today_str = now.strftime("%Y-%m-%d")
+            current_time = now.strftime("%H:%M")
+            if current_time == rem_time and last_sent_date != today_str:
+                data = load_data()
+                entries = [e for e in data if e["date"] == today_str]
+                if not entries:
+                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    text = f"⏰ ដាស់តឿន – ថ្ងៃនេះ {today_str} អ្នកមិនទាន់កត់ត្រាចំណូលទេ។ សូមបញ្ចូលចំនួនទឹកប្រាក់។"
+                    payload = {"chat_id": OWNER_ID, "text": text}
+                    requests.post(url, json=payload, timeout=10)
+                    last_sent_date = today_str
+        except Exception as e:
+            logger.error(f"Reminder worker error: {e}")
+        time.sleep(60)
+
 # ---------- Build Application ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
@@ -1214,7 +1636,6 @@ application = (
     .updater(None)
     .build()
 )
-# Existing handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("help", help_command))
 application.add_handler(CommandHandler("ping", ping))
@@ -1238,9 +1659,16 @@ application.add_handler(CommandHandler("permissions", permissions))
 application.add_handler(CommandHandler("sync", manual_sync))
 application.add_handler(CommandHandler("sync_status", sync_status))
 application.add_handler(CommandHandler("day", day_report))
+application.add_handler(CommandHandler("range", range_report))
+application.add_handler(CommandHandler("top", top))
+application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("search", search))
+application.add_handler(CommandHandler("lock", lock))
+application.add_handler(CommandHandler("unlock", unlock))
+application.add_handler(CommandHandler("remind", set_reminder))
+application.add_handler(CommandHandler("export", export_csv))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
 
-# Group monitoring
 application.add_handler(MessageHandler(
     filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
     group_message_handler
@@ -1250,7 +1678,13 @@ application.add_handler(CommandHandler("weekly", group_weekly_command, filters=f
 application.add_handler(CommandHandler("monthly", group_monthly_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("quarterly", group_quarterly_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("yearly", group_yearly_command, filters=filters.ChatType.GROUPS))
-# Private chat fallback
+application.add_handler(CommandHandler("range", group_range_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("top", group_top_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("duplicates", group_duplicates_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("edit_index", group_edit_index_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("summary", group_summary_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("bysender", group_bysender_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("compare", group_compare_command, filters=filters.ChatType.GROUPS))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
@@ -1277,7 +1711,6 @@ def set_webhook():
     result = LOOP.run_until_complete(application.bot.set_webhook(url))
     return f"Webhook set to {url} — Telegram replied: {result}"
 
-# ---------- Email webhook ----------
 @flask_app.route("/email_webhook", methods=["POST"])
 def email_webhook():
     secret = request.headers.get("X-Webhook-Secret", "")
@@ -1305,17 +1738,17 @@ def email_webhook():
     append_to_sheet(entry)
     return "OK", 200
 
-# ---------- Rebuild local data from Google Sheets BEFORE starting ----------
 try:
     rebuild_from_sheet()
 except Exception as e:
     logger.warning(f"Rebuild skipped due to error: {e}")
 
-# Start background threads
 sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True)
 sync_thread.start()
 announce_thread = threading.Thread(target=announcement_worker, args=(BOT_TOKEN,), daemon=True)
 announce_thread.start()
+reminder_thread = threading.Thread(target=reminder_worker, args=(BOT_TOKEN,), daemon=True)
+reminder_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
