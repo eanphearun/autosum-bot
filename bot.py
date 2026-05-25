@@ -116,11 +116,17 @@ if ALLOWED_GROUP_SENDERS:
         except ValueError:
             logger.warning(f"Invalid user ID in ALLOWED_GROUP_SENDERS: {uid_str}")
 
-# Announcement settings
-try:
-    ANNOUNCE_GROUP_ID = int(os.environ.get("ANNOUNCE_GROUP_ID", "0") or "0")
-except (ValueError, TypeError):
-    ANNOUNCE_GROUP_ID = 0
+# Announcement settings – can now be a comma‑separated list of group IDs
+_announce_ids_str = os.environ.get("ANNOUNCE_GROUP_ID", "") or ""
+ANNOUNCE_GROUP_IDS: List[int] = []
+if _announce_ids_str:
+    for gid_str in _announce_ids_str.split(","):
+        try:
+            gid = int(gid_str.strip())
+            if gid != 0:
+                ANNOUNCE_GROUP_IDS.append(gid)
+        except ValueError:
+            logger.warning(f"Invalid ANNOUNCE_GROUP_ID entry: {gid_str}")
 
 ANNOUNCE_TIME = os.environ.get("ANNOUNCE_TIME", "") or "21:00"
 REMINDER_TIME = os.environ.get("REMINDER_TIME", "") or None
@@ -565,7 +571,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ALLOWED_GROUP_SENDERS: {ALLOWED_GROUP_SENDERS or 'owner + managers'}\n"
         f"MANAGER_IDS: {list(managers.get('managers', {}).keys())}\n"
         f"MANAGER_GROUP_MAP: {managers.get('group_map', {})}\n"
-        f"ANNOUNCE_GROUP_ID: {ANNOUNCE_GROUP_ID}\n"
+        f"ANNOUNCE_GROUP_IDS: {ANNOUNCE_GROUP_IDS}\n"
         f"ANNOUNCE_TIME: {ANNOUNCE_TIME}\n"
         f"PAYWAY_BUSINESS: {PAYWAY_BUSINESS}\n"
         f"SHEET_NAME: {SHEET_NAME}"
@@ -1508,11 +1514,13 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ប្រតិបត្តិការ: {len(entries)}\n"
         f"សរុប: ${total_usd:.2f} / ៛{total_khr:,}"
     )
-    try:
-        await context.bot.send_message(chat_id=ANNOUNCE_GROUP_ID, text=msg)
-        await update.message.reply_text("✅ បានផ្ញើសេចក្តីសង្ខេបទៅក្រុម។")
-    except Exception as e:
-        await update.message.reply_text(f"បរាជ័យ៖ {e}")
+    for gid in ANNOUNCE_GROUP_IDS:
+        try:
+            await context.bot.send_message(chat_id=gid, text=msg)
+        except Exception as e:
+            await update.message.reply_text(f"បរាជ័យសម្រាប់ក្រុម {gid}៖ {e}")
+            continue
+    await update.message.reply_text("✅ បានផ្ញើសេចក្តីសង្ខេបទៅក្រុមទាំងអស់។")
 
 async def edit_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -1613,10 +1621,11 @@ def sync_worker(bot_token: str) -> None:
         time.sleep(SYNC_INTERVAL_MINUTES * 60)
 
 def announcement_worker(bot_token: str) -> None:
+    """Check every minute and send daily summary to all announcement groups at the set time."""
     last_sent_date = None
     while True:
         try:
-            if ANNOUNCE_GROUP_ID == 0:
+            if not ANNOUNCE_GROUP_IDS:
                 time.sleep(60)
                 continue
             tz = pytz.timezone("Asia/Phnom_Penh")
@@ -1635,8 +1644,12 @@ def announcement_worker(bot_token: str) -> None:
                         f"សរុប: ${total_usd:.2f} / ៛{total_khr:,}"
                     )
                     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                    payload = {"chat_id": ANNOUNCE_GROUP_ID, "text": msg}
-                    requests.post(url, json=payload, timeout=10)
+                    for gid in ANNOUNCE_GROUP_IDS:
+                        payload = {"chat_id": gid, "text": msg}
+                        try:
+                            requests.post(url, json=payload, timeout=10)
+                        except Exception as e:
+                            logger.error(f"Announce send failed for group {gid}: {e}")
                 last_sent_date = today_str
         except Exception as e:
             logger.error(f"Announcement worker error: {e}")
