@@ -653,7 +653,7 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
 # Group message handler (with semaphore and add_transaction)
 # -------------------------------------------------------------------
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("🔥 RAW GROUP MESSAGE: %s", update.message.text if update.message else "no message")
+    logger.info("📨 RAW GROUP MESSAGE: %s", update.message.text if update.message else "no message")
     async with _group_semaphore:
         if not update.message or not update.message.text:
             return
