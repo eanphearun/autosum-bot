@@ -9,6 +9,7 @@ import threading
 import uuid
 import csv
 import io
+import queue
 import statistics
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Set, Tuple
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------- Global flags ----------
 clear_confirmation_token = None
 MANUAL_LOCKED = False
+sheet_queue = queue.Queue()
 SEEN_TRX_IDS: Set[str] = set() 
 
 # ---------- Configuration ----------
@@ -157,8 +159,8 @@ def get_sheet():
     return client.open(SHEET_NAME).sheet1
 
 def append_to_sheet(entry: dict) -> None:
-    sheet = get_sheet()
-    if not sheet:
+    """Queue the row for background writing – fast and non‑blocking."""
+    if not GSPREAD_CREDENTIALS_JSON:
         return
     try:
         now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
@@ -174,12 +176,9 @@ def append_to_sheet(entry: dict) -> None:
             now,
             entry["tran_id"]
         ]
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-        logger.info(f"Sheet export: {entry.get('usd',0)}$ / {entry.get('khr',0)}៛ (ID: {entry['tran_id']})")
-        # Also write to the business‑specific sheet (outside the try block)
-        append_to_business_sheet(entry, row)
+        sheet_queue.put((entry, row))
     except Exception as e:
-        logger.error(f"Sheet export failed: {e}")
+        logger.error(f"Failed to queue sheet row: {e}")
 
 def get_sheet_by_name(sheet_name: str):
     if not GSPREAD_CREDENTIALS_JSON:
@@ -216,7 +215,7 @@ def get_all_businesses_sheet():
         logger.error(f"Error opening '{ALL_BUSINESSES_SHEET}': {e}")
         return None
 
-def append_to_business_sheet(entry: dict, row: list) -> None:
+#def append_to_business_sheet(entry: dict, row: list) -> None:
     """Write a copy of the row to the single 'All Businesses' sheet."""
     # Only write if the entry has a business tag different from 'manual'?
     # We'll write everything with a business tag (including manual, group, etc.)
@@ -1403,21 +1402,40 @@ async def group_compare_command(update: Update, context: ContextTypes.DEFAULT_TY
     data = load_data()
     group_id = update.message.chat.id
     group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
-    today_entries = [e for e in data if e["date"] == today.strftime("%Y-%m-%d") and (
-        e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)
-    )]
-    yesterday_entries = [e for e in data if e["date"] == yesterday.strftime("%Y-%m-%d") and (
-        e.get("source","").startswith(f"group_{group_id}_") or (not e.get("source") and e.get("business")==group_tag)
-    )]
-    total_today = sum(e["usd"] for e in today_entries)
-    total_yesterday = sum(e["usd"] for e in yesterday_entries)
-    change = "N/A" if total_yesterday == 0 else f"{(total_today - total_yesterday) / total_yesterday * 100:+.1f}%"
-    await update.message.reply_text(
+
+    def filter_group(entries):
+        return [
+            e for e in entries
+            if e.get("source", "").startswith(f"group_{group_id}_")
+            or (not e.get("source") and e.get("business") == group_tag)
+        ]
+
+    today_entries = filter_group([e for e in data if e["date"] == today.strftime("%Y-%m-%d")])
+    yesterday_entries = filter_group([e for e in data if e["date"] == yesterday.strftime("%Y-%m-%d")])
+
+    def combined_total(entries):
+        return sum(e["usd"] + e["khr"] / 4000 for e in entries)
+
+    total_today = combined_total(today_entries)
+    total_yesterday = combined_total(yesterday_entries)
+
+    if total_yesterday == 0:
+        change = "N/A"
+    else:
+        change = f"{(total_today - total_yesterday) / total_yesterday * 100:+.1f}%"
+
+    today_usd = sum(e["usd"] for e in today_entries)
+    today_khr = sum(e["khr"] for e in today_entries)
+    yesterday_usd = sum(e["usd"] for e in yesterday_entries)
+    yesterday_khr = sum(e["khr"] for e in yesterday_entries)
+
+    msg = (
         f"📊 ប្រៀបធៀបថ្ងៃនេះ vs ម្សិលមិញ សម្រាប់ក្រុមនេះ៖\n"
-        f"ថ្ងៃនេះ: ${total_today:.2f}\n"
-        f"ម្សិលមិញ: ${total_yesterday:.2f}\n"
+        f"ថ្ងៃនេះ: ${today_usd:.2f} / ៛{today_khr:,}  (≈ ${total_today:.2f})\n"
+        f"ម្សិលមិញ: ${yesterday_usd:.2f} / ៛{yesterday_khr:,}  (≈ ${total_yesterday:.2f})\n"
         f"ផ្លាស់ប្តូរ: {change}"
     )
+    await update.message.reply_text(msg)
 
 async def group_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
@@ -1534,16 +1552,27 @@ async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     today_entries = [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
     yesterday_entries = [e for e in data if e["date"] == yesterday.strftime("%Y-%m-%d")]
-    total_today = sum(e["usd"] for e in today_entries)
-    total_yesterday = sum(e["usd"] for e in yesterday_entries)
+
+    def combined_total(entries):
+        return sum(e["usd"] + e["khr"] / 4000 for e in entries)
+
+    total_today = combined_total(today_entries)
+    total_yesterday = combined_total(yesterday_entries)
+
     if total_yesterday == 0:
         change = "N/A"
     else:
         change = f"{(total_today - total_yesterday) / total_yesterday * 100:+.1f}%"
+
+    today_usd = sum(e["usd"] for e in today_entries)
+    today_khr = sum(e["khr"] for e in today_entries)
+    yesterday_usd = sum(e["usd"] for e in yesterday_entries)
+    yesterday_khr = sum(e["khr"] for e in yesterday_entries)
+
     msg = (
         f"📊 ប្រៀបធៀបថ្ងៃនេះ vs ម្សិលមិញ៖\n"
-        f"ថ្ងៃនេះ: ${total_today:.2f}\n"
-        f"ម្សិលមិញ: ${total_yesterday:.2f}\n"
+        f"ថ្ងៃនេះ: ${today_usd:.2f} / ៛{today_khr:,}  (≈ ${total_today:.2f})\n"
+        f"ម្សិលមិញ: ${yesterday_usd:.2f} / ៛{yesterday_khr:,}  (≈ ${total_yesterday:.2f})\n"
         f"ផ្លាស់ប្តូរ: {change}"
     )
     await update.message.reply_text(msg)
@@ -1872,6 +1901,33 @@ def reminder_worker(bot_token: str) -> None:
             logger.error(f"Reminder worker error: {e}")
         time.sleep(60)
 
+def sheet_worker() -> None:
+    """Continuously process queued sheet rows."""
+    while True:
+        try:
+            entry, row = sheet_queue.get()
+            if entry is None:   # sentinel to stop the thread
+                break
+            # Write to master sheet
+            sheet = get_sheet()
+            if sheet:
+                try:
+                    sheet.append_row(row, value_input_option="USER_ENTERED")
+                    logger.info(f"Sheet export (background): {entry.get('usd',0)}$ / {entry.get('khr',0)}៛ (ID: {entry.get('tran_id','')})")
+                except Exception as e:
+                    logger.error(f"Master sheet write failed: {e}")
+            # Write to the All Businesses sheet
+            try:
+                biz_sheet = get_all_businesses_sheet()
+                if biz_sheet:
+                    biz_sheet.append_row(row, value_input_option="USER_ENTERED")
+            except Exception as e:
+                logger.error(f"All Businesses sheet write failed: {e}")
+        except Exception as e:
+            logger.error(f"Sheet worker error: {e}")
+        finally:
+            sheet_queue.task_done()
+
 # ---------- Build Application ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
@@ -1998,6 +2054,8 @@ sync_thread = threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=Tru
 sync_thread.start()
 announce_thread = threading.Thread(target=announcement_worker, args=(BOT_TOKEN,), daemon=True)
 announce_thread.start()
+sheet_thread = threading.Thread(target=sheet_worker, daemon=True)
+sheet_thread.start()
 reminder_thread = threading.Thread(target=reminder_worker, args=(BOT_TOKEN,), daemon=True)
 reminder_thread.start()
 
