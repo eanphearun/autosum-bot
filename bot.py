@@ -1505,7 +1505,8 @@ async def group_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Show the report as a new message
     await context.bot.send_message(chat_id=chat_id, text=summary_text)
     # Keep the menu visible
-    await query.edit_message_text("📊 ជ្រើសរើសរបាយការណ៍៖", reply_markup=group_menu_keyboard())
+    if query.message.text != "📊 ជ្រើសរើសរបាយការណ៍៖" or query.message.reply_markup != group_menu_keyboard():
+        await query.edit_message_text("📊 ជ្រើសរើសរបាយការណ៍៖", reply_markup=group_menu_keyboard())
 
 def group_menu_keyboard():
     return InlineKeyboardMarkup([
