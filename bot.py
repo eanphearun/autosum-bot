@@ -433,6 +433,24 @@ def stats_data(entries: list) -> dict:
         "min_khr": min(khr_amounts) if khr_amounts else 0,
     }
 
+def business_breakdown(entries: list) -> str:
+    """Return a string showing total USD & KHR per business tag."""
+    if not entries:
+        return "គ្មានទិន្នន័យ។"
+    grouped = defaultdict(list)
+    for e in entries:
+        biz = e.get("business", "unknown")
+        grouped[biz].append(e)
+
+    lines = ["📊 សរុបតាមអាជីវកម្ម៖"]
+    for biz in sorted(grouped.keys()):
+        biz_entries = grouped[biz]
+        usd = sum(e["usd"] for e in biz_entries)
+        khr = sum(e["khr"] for e in biz_entries)
+        count = len(biz_entries)
+        lines.append(f"• {biz}: ${usd:.2f} / ៛{khr:,} ({count} ប្រតិបត្តិការ)")
+    return "\n".join(lines)
+
 def search_entries(data: list, keyword: str) -> list:
     kw = keyword.lower()
     return [e for e in data if kw in (e.get("note", "") or "").lower()]
@@ -665,6 +683,19 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for i, e in enumerate(top_entries, 1):
         lines.append(f"{i}. {e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
     await update.message.reply_text("\n".join(lines))
+
+async def bybusiness_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    period = "daily"
+    if context.args:
+        period = context.args[0].lower()
+    data = load_data()
+    entries = get_entries_for_period(data, period)
+    if not entries:
+        await update.message.reply_text(f"គ្មានប្រតិបត្តិការ {period}។")
+        return
+    await update.message.reply_text(business_breakdown(entries))
 
 async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -1445,6 +1476,27 @@ async def group_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=group_menu_keyboard()
         )
         return
+
+    elif data == "grpmenu_bybusiness":
+        # Show business breakdown for today (group only)
+        today = datetime.date.today()
+        data = load_data()
+        group_id = chat_id
+        group_tag = group_business_map.get(group_id, GROUP_BUSINESS_TAG)
+        # Filter entries belonging to this group
+        entries = [
+            e for e in data
+            if e["date"] == today.strftime("%Y-%m-%d") and (
+                e.get("source", "").startswith(f"group_{group_id}_") or
+                (not e.get("source") and e.get("business") == group_tag)
+            )
+        ]
+        text = business_breakdown(entries) if entries else "ថ្ងៃនេះមិនមានប្រតិបត្តិការសម្រាប់ក្រុមនេះទេ។"
+        await context.bot.send_message(chat_id=chat_id, text=text)
+        # Keep the menu visible
+        await query.edit_message_text("📊 ជ្រើសរើសរបាយការណ៍៖", reply_markup=group_menu_keyboard())
+        return
+
     else:
         return
 
@@ -1464,6 +1516,9 @@ def group_menu_keyboard():
             InlineKeyboardButton("ត្រីមាសនេះ", callback_data="grpmenu_quarterly"),
             InlineKeyboardButton("ឆ្នាំនេះ", callback_data="grpmenu_yearly"),
             InlineKeyboardButton("ជួរកាលបរិច្ឆេទ", callback_data="grpmenu_range")
+        ],
+        [
+            InlineKeyboardButton("អាជីវកម្ម", callback_data="grpmenu_bybusiness")
         ],
         [
             InlineKeyboardButton("❌ បិទ", callback_data="grpmenu_close")
@@ -1857,6 +1912,7 @@ application.add_handler(CommandHandler("lock", lock))
 application.add_handler(CommandHandler("unlock", unlock))
 application.add_handler(CommandHandler("remind", set_reminder))
 application.add_handler(CommandHandler("export", export_csv))
+application.add_handler(CommandHandler("bybusiness", bybusiness_command))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
 
 application.add_handler(MessageHandler(
