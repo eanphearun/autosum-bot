@@ -1032,6 +1032,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     append_to_sheet(entry)
     logger.info(f"Group payment recorded: ${usd:.2f} / {khr}៛ from group {msg.chat.id} (business: {business_tag})")
 
+
 # ---------- Group period reports ----------
 def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
     if today is None:
@@ -1387,6 +1388,88 @@ async def group_compare_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"ផ្លាស់ប្តូរ: {change}"
     )
 
+async def group_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.id not in MONITORED_GROUP_IDS:
+        return
+    if not _can_use_group_commands(update.effective_user.id, update.message.chat.id):
+        return
+
+    await update.message.reply_text(
+        "📊 ជ្រើសរើសរបាយការណ៍៖",
+        reply_markup=group_menu_keyboard()
+    )
+
+async def group_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    if not _can_use_group_commands(user_id, chat_id):
+        await query.edit_message_text("អ្នកមិនមានសិទ្ធិប្រើម៉ឺនុយនេះទេ។")
+        return
+
+    data = query.data
+
+    if data == "grpmenu_close":
+        try:
+            await query.message.delete()
+        except:
+            pass
+        return
+
+    today = datetime.date.today()
+    label = ""
+    if data == "grpmenu_daily":
+        label = f"ថ្ងៃទី {today.strftime('%Y-%m-%d')}"
+        summary_text = group_period_summary(chat_id, "daily", label, today)
+    elif data == "grpmenu_weekly":
+        week_start = today - datetime.timedelta(days=today.weekday())
+        label = f"សប្ដាហ៍ ({week_start.strftime('%Y-%m-%d')} → {today.strftime('%Y-%m-%d')})"
+        summary_text = group_period_summary(chat_id, "weekly", label, today)
+    elif data == "grpmenu_monthly":
+        label = f"ខែ {today.strftime('%Y-%m')}"
+        summary_text = group_period_summary(chat_id, "monthly", label, today)
+    elif data == "grpmenu_quarterly":
+        quarter = (today.month - 1) // 3 + 1
+        label = f"ត្រីមាសទី {quarter} ឆ្នាំ {today.year}"
+        summary_text = group_period_summary(chat_id, "quarterly", label, today)
+    elif data == "grpmenu_yearly":
+        label = f"ឆ្នាំ {today.year}"
+        summary_text = group_period_summary(chat_id, "yearly", label, today)
+    elif data == "grpmenu_range":
+        await query.edit_message_text(
+            "📅 សូមប្រើ `/range YYYY-MM-DD YYYY-MM-DD`\n"
+            "ឧទាហរណ៍: `/range 2026-05-01 2026-05-25`",
+            reply_markup=group_menu_keyboard()
+        )
+        return
+    else:
+        return
+
+    # Show the report as a new message
+    await context.bot.send_message(chat_id=chat_id, text=summary_text)
+    # Keep the menu visible
+    await query.edit_message_text("📊 ជ្រើសរើសរបាយការណ៍៖", reply_markup=group_menu_keyboard())
+
+def group_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("ថ្ងៃនេះ", callback_data="grpmenu_daily"),
+            InlineKeyboardButton("សប្ដាហ៍នេះ", callback_data="grpmenu_weekly"),
+            InlineKeyboardButton("ខែនេះ", callback_data="grpmenu_monthly")
+        ],
+        [
+            InlineKeyboardButton("ត្រីមាសនេះ", callback_data="grpmenu_quarterly"),
+            InlineKeyboardButton("ឆ្នាំនេះ", callback_data="grpmenu_yearly"),
+            InlineKeyboardButton("ជួរកាលបរិច្ឆេទ", callback_data="grpmenu_range")
+        ],
+        [
+            InlineKeyboardButton("❌ បិទ", callback_data="grpmenu_close")
+        ]
+    ])
+
 # ---------- Previous owner-only commands (compare, chart, summary, bysender, undo_delete, duplicates, announce, edit_index, recent, delete_index) ----------
 async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -1529,27 +1612,49 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ANNOUNCE_GROUP_IDS:
         await update.message.reply_text("ANNOUNCE_GROUP_IDS មិនបានកំណត់ទេ។")
         return
+
     today = datetime.date.today()
     data = load_data()
-    entries = [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
-    if not entries:
+    entries_today = [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
+
+    if not entries_today:
         await update.message.reply_text("ថ្ងៃនេះមិនទាន់មានប្រតិបត្តិការទេ។")
         return
-    total_usd = sum(e["usd"] for e in entries)
-    total_khr = sum(e["khr"] for e in entries)
-    msg = (
-        f"📊 សេចក្តីសង្ខេបថ្ងៃនេះ ({today.strftime('%Y-%m-%d')})\n"
-        f"ប្រតិបត្តិការ: {len(entries)}\n"
-        f"សរុប: ${total_usd:.2f} / ៛{total_khr:,}"
-    )
-    for gid in ANNOUNCE_GROUP_IDS:
-        try:
-            await context.bot.send_message(chat_id=gid, text=msg)
-        except Exception as e:
-            await update.message.reply_text(f"បរាជ័យសម្រាប់ក្រុម {gid}៖ {e}")
-            continue
-    await update.message.reply_text("✅ បានផ្ញើសេចក្តីសង្ខេបទៅក្រុមទាំងអស់។")
 
+    # Optional: filter by a specific business tag if provided as argument
+    if context.args:
+        business_filter = context.args[0].lower()
+        entries_today = [e for e in entries_today if e.get("business") == business_filter]
+        if not entries_today:
+            await update.message.reply_text(f"គ្មានប្រតិបត្តិការសម្រាប់ {business_filter} ថ្ងៃនេះទេ។")
+            return
+
+    # Group by business tag
+    grouped = defaultdict(list)
+    for e in entries_today:
+        biz = e.get("business", "unknown")
+        grouped[biz].append(e)
+
+    # Send one message per business tag
+    for biz in sorted(grouped.keys()):
+        entries = grouped[biz]
+        total_usd = sum(e["usd"] for e in entries)
+        total_khr = sum(e["khr"] for e in entries)
+        count = len(entries)
+        msg = (
+            f"📊 សេចក្តីសង្ខេបថ្ងៃនេះ ({today.strftime('%Y-%m-%d')})\n"
+            f"អាជីវកម្ម: {biz}\n"
+            f"ប្រតិបត្តិការ: {count}\n"
+            f"សរុប: ${total_usd:.2f} / ៛{total_khr:,}"
+        )
+        for gid in ANNOUNCE_GROUP_IDS:
+            try:
+                await context.bot.send_message(chat_id=gid, text=msg)
+            except Exception as e:
+                await update.message.reply_text(f"បរាជ័យសម្រាប់ក្រុម {gid}៖ {e}")
+                continue
+
+    await update.message.reply_text("✅ បានផ្ញើសេចក្តីសង្ខេបតាមអាជីវកម្មទៅក្រុមទាំងអស់។")
 async def edit_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1770,6 +1875,8 @@ application.add_handler(CommandHandler("edit_index", group_edit_index_command, f
 application.add_handler(CommandHandler("summary", group_summary_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("bysender", group_bysender_command, filters=filters.ChatType.GROUPS))
 application.add_handler(CommandHandler("compare", group_compare_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("menu", group_menu_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CallbackQueryHandler(group_menu_callback, pattern="^grpmenu_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 LOOP = asyncio.new_event_loop()
