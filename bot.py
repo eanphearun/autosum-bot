@@ -195,25 +195,42 @@ def get_sheet_by_name(sheet_name: str):
         sheet = client.create(sheet_name)
         return sheet.sheet1
 
-def get_business_sheet_name(business_tag: str) -> str:
-    if BUSINESS_SHEET_MAP:
-        for pair in BUSINESS_SHEET_MAP.split(","):
-            if ":" in pair:
-                tag, name = pair.split(":", 1)
-                if tag.strip() == business_tag:
-                    return name.strip()
-    return f"{SHEET_NAME} - {business_tag}"
+# Name of the single sheet for all business transactions
+ALL_BUSINESSES_SHEET = f"{SHEET_NAME} - All Businesses"
+
+def get_all_businesses_sheet():
+    """Return the single sheet used for all business-tagged transactions.
+    Does NOT create it automatically – must exist and be shared with the service account."""
+    if not GSPREAD_CREDENTIALS_JSON:
+        return None
+    try:
+        creds_dict = json.loads(GSPREAD_CREDENTIALS_JSON)
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client.open(ALL_BUSINESSES_SHEET).sheet1
+    except SpreadsheetNotFound:
+        logger.error(f"'{ALL_BUSINESSES_SHEET}' not found. Please create it manually and share with the service account.")
+        return None
+    except Exception as e:
+        logger.error(f"Error opening '{ALL_BUSINESSES_SHEET}': {e}")
+        return None
 
 def append_to_business_sheet(entry: dict, row: list) -> None:
-    """Write a copy of the row to the business‑specific sheet (best‑effort)."""
+    """Write a copy of the row to the single 'All Businesses' sheet."""
+    # Only write if the entry has a business tag different from 'manual'?
+    # We'll write everything with a business tag (including manual, group, etc.)
+    biz_sheet = get_all_businesses_sheet()
+    if not biz_sheet:
+        return
     try:
-        business = entry.get("business", "manual")
-        biz_sheet_name = get_business_sheet_name(business)
-        biz_sheet = get_sheet_by_name(biz_sheet_name)
-        if biz_sheet:
-            biz_sheet.append_row(row, value_input_option="USER_ENTERED")
+        # Add the business tag as a new column (or reuse an existing one?)
+        # The master sheet row already has columns A-H. We'll append the same row + business tag again? 
+        # Actually the row already contains the business in column F. So we can just append the same row.
+        # But to make it clearer, we can add a duplicate row; it's fine.
+        biz_sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
-        logger.error(f"Business sheet write failed for {business}: {e}")
+        logger.error(f"All Businesses sheet write failed: {e}")
 
 def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
     if not tran_id:
