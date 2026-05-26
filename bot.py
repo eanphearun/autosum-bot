@@ -12,10 +12,8 @@ import io
 import queue
 import statistics
 import hmac
-import hashlib
-import tempfile
+import sqlite3
 from collections import defaultdict
-from functools import lru_cache
 from typing import List, Dict, Any, Optional, Set, Tuple
 
 import random
@@ -25,7 +23,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread.exceptions import SpreadsheetNotFound
 
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -41,6 +39,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# -------------------------------------------------------------------
+# Logging & configuration
+# -------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -48,11 +49,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Global flags ----------
+# Global flags
 clear_confirmation_token = None
 clear_confirmation_token_time: Optional[float] = None
 CLEAR_TOKEN_TTL = 120
-
 MANUAL_LOCKED = False
 sheet_queue = queue.Queue()
 SEEN_TRX_IDS: Set[str] = set()
@@ -64,20 +64,13 @@ _user_msg_times: Dict[int, List[float]] = defaultdict(list)
 RATE_LIMIT_MAX = 20
 RATE_LIMIT_WINDOW = 60
 
-# Data file lock (prevents lost updates)
-_data_lock = threading.Lock()
+# Concurrency limit for group messages
+_group_semaphore = asyncio.Semaphore(5)
 
-# Size limits
 MAX_NOTE_LEN = 200
 MAX_WEBHOOK_BODY = 64 * 1024
 
-# ---------- Configuration ----------
-DATA_FILE = "income.json"
-SYNC_STATE_FILE = "sync_state.json"
-MANAGERS_FILE = "managers.json"
-DELETED_FILE = "deleted.json"
-REMINDER_FILE = "reminder.txt"
-
+# Environment variables
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 MANAGER_IDS: Set[int] = set()
@@ -108,11 +101,7 @@ PAYWAY_BASE_URL = os.environ.get("PAYWAY_BASE_URL", "https://www.payway.com.kh/a
 PAYWAY_BUSINESS = os.environ.get("PAYWAY_BUSINESS", "birdnest")
 SYNC_INTERVAL_MINUTES = int(os.environ.get("SYNC_INTERVAL_MINUTES", "5"))
 
-MONITORED_GROUP_IDS = [
-    int(gid.strip())
-    for gid in os.environ.get("MONITORED_GROUP_IDS", "").split(",")
-    if gid.strip()
-]
+MONITORED_GROUP_IDS = [int(gid.strip()) for gid in os.environ.get("MONITORED_GROUP_IDS", "").split(",") if gid.strip()]
 GROUP_BUSINESS_TAG = os.environ.get("GROUP_BUSINESS_TAG", "group_payments")
 
 group_business_map: Dict[int, str] = {}
@@ -137,8 +126,8 @@ if ALLOWED_GROUP_SENDERS:
         except ValueError:
             logger.warning("Invalid user ID in ALLOWED_GROUP_SENDERS: %s", uid_str)
 
-_announce_ids_str = os.environ.get("ANNOUNCE_GROUP_ID", "") or ""
 ANNOUNCE_GROUP_IDS: List[int] = []
+_announce_ids_str = os.environ.get("ANNOUNCE_GROUP_ID", "") or ""
 if _announce_ids_str:
     for gid_str in _announce_ids_str.split(","):
         try:
@@ -149,12 +138,8 @@ if _announce_ids_str:
             logger.warning("Invalid ANNOUNCE_GROUP_ID entry: %s", gid_str)
 
 ANNOUNCE_TIME = os.environ.get("ANNOUNCE_TIME", "") or "21:00"
-REMINDER_TIME = os.environ.get("REMINDER_TIME", "") or None
-BUSINESS_SHEET_MAP = os.environ.get("BUSINESS_SHEET_MAP", "")
-
 GSPREAD_CREDENTIALS_JSON = os.environ.get("GSPREAD_CREDENTIALS_JSON", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Bird Nest Income")
-
 EMAIL_WEBHOOK_SECRET = os.environ.get("EMAIL_WEBHOOK_SECRET", "")
 
 CATEGORIES = {
@@ -163,40 +148,160 @@ CATEGORIES = {
     "other": "💸 ផ្សេងៗ"
 }
 
-_SHEET_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+DATA_FILE = "income.json"
+SYNC_STATE_FILE = "sync_state.json"
+MANAGERS_FILE = "managers.json"
+DELETED_FILE = "deleted.json"
+REMINDER_FILE = "reminder.txt"
+DB_FILE = "income.db"
+ALL_BUSINESSES_SHEET = f"{SHEET_NAME} - All Businesses"
 
+# -------------------------------------------------------------------
+# SQLite helpers
+# -------------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            usd REAL NOT NULL,
+            khr INTEGER NOT NULL,
+            category TEXT,
+            note TEXT,
+            business TEXT,
+            source TEXT,
+            timestamp TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON transactions(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_business ON transactions(business)")
+    conn.close()
+
+def migrate_json_to_sqlite():
+    if not os.path.exists(DB_FILE):
+        init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM transactions")
+    if cur.fetchone()[0] > 0:
+        conn.close()
+        return
+    if not os.path.exists(DATA_FILE):
+        conn.close()
+        return
+    try:
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+        for entry in data:
+            cur.execute(
+                "INSERT OR IGNORE INTO transactions (id, date, usd, khr, category, note, business, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+                 entry.get("source", ""), datetime.datetime.now().isoformat())
+            )
+        conn.commit()
+        logger.info("Migrated %d entries from JSON to SQLite", len(data))
+        os.rename(DATA_FILE, DATA_FILE + ".bak")
+    except Exception as e:
+        logger.error("Migration failed: %s", e)
+    finally:
+        conn.close()
+
+def load_data() -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT id as tran_id, date, usd, khr, category, note, business, source FROM transactions ORDER BY date, timestamp")
+    rows = cur.fetchall()
+    data = [dict(row) for row in rows]
+    conn.close()
+    return data
+
+def add_transaction(entry: Dict[str, Any]) -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+         entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+         entry.get("source", ""), datetime.datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def delete_transaction(tran_id: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE id = ?", (tran_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+def update_transaction(tran_id: str, new_entry: Dict[str, Any]) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE transactions SET date=?, usd=?, khr=?, category=?, note=?, business=?, source=?, timestamp=? WHERE id=?",
+        (new_entry["date"], new_entry["usd"], new_entry["khr"],
+         new_entry.get("category", "other"), new_entry.get("note", ""),
+         new_entry.get("business", "manual"), new_entry.get("source", ""),
+         datetime.datetime.now().isoformat(), tran_id)
+    )
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+def load_sync_state() -> Dict[str, Any]:
+    if os.path.exists(SYNC_STATE_FILE):
+        with open(SYNC_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"last_sync": None, "imported_ids": []}
+
+def save_sync_state(state: Dict[str, Any]) -> None:
+    with open(SYNC_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def load_managers() -> Dict[str, Any]:
+    if os.path.exists(MANAGERS_FILE):
+        with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    data = {"managers": {}, "group_map": {}}
+    if MANAGER_IDS:
+        for uid in MANAGER_IDS:
+            data["managers"][str(uid)] = {"businesses": []}
+    if manager_group_map:
+        for uid, groups in manager_group_map.items():
+            data["group_map"][str(uid)] = list(groups)
+    return data
+
+def save_managers(data: Dict[str, Any]) -> None:
+    with open(MANAGERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_deleted() -> List[Dict[str, Any]]:
+    if os.path.exists(DELETED_FILE):
+        with open(DELETED_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_deleted(deleted: List[Dict[str, Any]]) -> None:
+    with open(DELETED_FILE, "w", encoding="utf-8") as f:
+        json.dump(deleted, f, ensure_ascii=False, indent=2)
+
+# -------------------------------------------------------------------
+# Google Sheets helpers
+# -------------------------------------------------------------------
+_SHEET_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 def _sanitise_sheet_value(value: str) -> str:
     value = str(value).strip()
     if value and value[0] in _SHEET_FORMULA_PREFIXES:
         value = "'" + value
     return value[:MAX_NOTE_LEN]
 
-def _is_rate_limited(user_id: int) -> bool:
-    now = time.monotonic()
-    with _rate_limit_lock:
-        times = _user_msg_times[user_id]
-        cutoff = now - RATE_LIMIT_WINDOW
-        _user_msg_times[user_id] = [t for t in times if t > cutoff]
-        if len(_user_msg_times[user_id]) >= RATE_LIMIT_MAX:
-            return True
-        _user_msg_times[user_id].append(now)
-        return False
-
-def _atomic_save(path: str, data: Any) -> None:
-    dir_ = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-# ---------- Google Sheets Helpers ----------
 def get_sheet():
     if not GSPREAD_CREDENTIALS_JSON:
         return None
@@ -227,22 +332,6 @@ def append_to_sheet(entry: dict) -> None:
     except Exception as e:
         logger.error("Failed to queue sheet row: %s", e)
 
-def get_sheet_by_name(sheet_name: str):
-    if not GSPREAD_CREDENTIALS_JSON:
-        return None
-    creds_dict = json.loads(GSPREAD_CREDENTIALS_JSON)
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    try:
-        return client.open(sheet_name).sheet1
-    except SpreadsheetNotFound:
-        logger.info("Creating new sheet: %s", sheet_name)
-        sheet = client.create(sheet_name)
-        return sheet.sheet1
-
-ALL_BUSINESSES_SHEET = f"{SHEET_NAME} - All Businesses"
-
 def get_all_businesses_sheet():
     if not GSPREAD_CREDENTIALS_JSON:
         return None
@@ -260,8 +349,6 @@ def get_all_businesses_sheet():
         return None
 
 def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
-    if not tran_id:
-        return False
     sheet = get_sheet()
     if not sheet:
         return False
@@ -272,15 +359,12 @@ def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
                 sheet.delete_row(i + 1)
                 logger.info("Deleted sheet row with tran_id %s", tran_id)
                 return True
-        logger.warning("No sheet row found for tran_id %s", tran_id)
         return False
     except Exception as e:
         logger.error("Error deleting sheet row: %s", e)
         return False
 
 def update_sheet_row_by_tran_id(tran_id: str, new_entry: dict) -> bool:
-    if not tran_id:
-        return False
     sheet = get_sheet()
     if not sheet:
         return False
@@ -306,7 +390,10 @@ def rebuild_from_sheet() -> None:
         if len(rows) < 2:
             logger.info("Sheet empty, nothing to rebuild.")
             return
-        new_data = []
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("PRAGMA journal_mode=WAL")
+        cur = conn.cursor()
+        cur.execute("DELETE FROM transactions")
         imported_ids = set()
         for row in rows[1:]:
             if not any(row):
@@ -319,25 +406,19 @@ def rebuild_from_sheet() -> None:
             category_val = row[3] if len(row) > 3 else "other"
             note_val = row[4] if len(row) > 4 else ""
             business_val = row[5] if len(row) > 5 else "manual"
-            tran_id_val = row[7] if len(row) > 7 else ""
-            entry = {
-                "date": date_val,
-                "usd": usd_val,
-                "khr": khr_val,
-                "category": category_val.lower(),
-                "note": note_val[:MAX_NOTE_LEN],
-                "business": business_val,
-                "tran_id": tran_id_val
-            }
-            if tran_id_val:
-                imported_ids.add(tran_id_val)
-            new_data.append(entry)
-        save_data(new_data)
+            tran_id_val = row[7] if len(row) > 7 else str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO transactions (id, date, usd, khr, category, note, business, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tran_id_val, date_val, usd_val, khr_val, category_val.lower(), note_val[:MAX_NOTE_LEN], business_val, datetime.datetime.now().isoformat())
+            )
+            imported_ids.add(tran_id_val)
+        conn.commit()
+        conn.close()
         state = load_sync_state()
         state["imported_ids"] = list(imported_ids)
         state["last_sync"] = datetime.datetime.now().isoformat() if imported_ids else None
         save_sync_state(state)
-        logger.info("Rebuilt %d transactions from Google Sheets.", len(new_data))
+        logger.info("Rebuilt %d transactions from Google Sheets into SQLite.", len(imported_ids))
     except Exception as e:
         logger.error("Rebuild failed: %s", e)
 
@@ -350,71 +431,9 @@ def seed_seen_trx_ids() -> None:
             if m:
                 SEEN_TRX_IDS.add(m.group(1))
 
-# ---------- Data helpers with thread lock ----------
-def load_data() -> List[Dict[str, Any]]:
-    with _data_lock:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
-
-def save_data(data: List[Dict[str, Any]]) -> None:
-    with _data_lock:
-        _atomic_save(DATA_FILE, data)
-
-def load_sync_state() -> Dict[str, Any]:
-    with _data_lock:
-        if os.path.exists(SYNC_STATE_FILE):
-            with open(SYNC_STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {"last_sync": None, "imported_ids": []}
-
-def save_sync_state(state: Dict[str, Any]) -> None:
-    with _data_lock:
-        _atomic_save(SYNC_STATE_FILE, state)
-
-# Cache for managers file
-_managers_cache: Optional[Dict[str, Any]] = None
-_managers_cache_lock = threading.Lock()
-
-def load_managers() -> Dict[str, Any]:
-    global _managers_cache
-    with _managers_cache_lock:
-        if _managers_cache is not None:
-            return _managers_cache
-    if os.path.exists(MANAGERS_FILE):
-        with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = {"managers": {}, "group_map": {}}
-        if MANAGER_IDS:
-            for uid in MANAGER_IDS:
-                data["managers"][str(uid)] = {"businesses": []}
-        if manager_group_map:
-            for uid, groups in manager_group_map.items():
-                data["group_map"][str(uid)] = list(groups)
-    with _managers_cache_lock:
-        _managers_cache = data
-    return data
-
-def save_managers(data: Dict[str, Any]) -> None:
-    global _managers_cache
-    _atomic_save(MANAGERS_FILE, data)
-    with _managers_cache_lock:
-        _managers_cache = data
-
-def load_deleted() -> List[Dict[str, Any]]:
-    with _data_lock:
-        if os.path.exists(DELETED_FILE):
-            with open(DELETED_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
-
-def save_deleted(deleted: List[Dict[str, Any]]) -> None:
-    with _data_lock:
-        _atomic_save(DELETED_FILE, deleted)
-
-# ---------- Helper functions ----------
+# -------------------------------------------------------------------
+# Core helper functions
+# -------------------------------------------------------------------
 def extract_amounts(text: str) -> Tuple[float, float, str]:
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
     usd_match = re.search(r"\$([\d\.]+)", text)
@@ -494,6 +513,188 @@ def search_entries(data: list, keyword: str) -> list:
     kw = keyword.lower()
     return [e for e in data if kw in (e.get("note", "") or "").lower()]
 
+def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
+    if today is None:
+        today = datetime.date.today()
+    if period == "daily":
+        return [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
+    elif period == "weekly":
+        week_start = today - datetime.timedelta(days=today.weekday())
+        week_dates = {(week_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
+        return [e for e in data if e["date"] in week_dates]
+    elif period == "monthly":
+        month_prefix = today.strftime("%Y-%m")
+        return [e for e in data if e["date"].startswith(month_prefix)]
+    elif period == "quarterly":
+        quarter = (today.month - 1) // 3 + 1
+        start_month = (quarter - 1) * 3 + 1
+        start_date = datetime.date(today.year, start_month, 1)
+        end_date = today
+        dates = set()
+        d = start_date
+        while d <= end_date:
+            dates.add(d.strftime("%Y-%m-%d"))
+            d += datetime.timedelta(days=1)
+        return [e for e in data if e["date"] in dates]
+    elif period == "yearly":
+        year_prefix = today.strftime("%Y")
+        return [e for e in data if e["date"].startswith(year_prefix)]
+    return []
+
+def _is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        times = _user_msg_times[user_id]
+        cutoff = now - RATE_LIMIT_WINDOW
+        _user_msg_times[user_id] = [t for t in times if t > cutoff]
+        if len(_user_msg_times[user_id]) >= RATE_LIMIT_MAX:
+            return True
+        _user_msg_times[user_id].append(now)
+        return False
+
+def is_allowed_sender(user_id: int, chat_id: int) -> bool:
+    if allowed_sender_ids:
+        return user_id in allowed_sender_ids
+    if user_id == OWNER_ID:
+        return True
+    managers = load_managers()
+    mgrs = managers.get("managers", {})
+    group_map = managers.get("group_map", {})
+    if str(user_id) in mgrs:
+        groups = group_map.get(str(user_id))
+        if groups is None:
+            return True
+        return chat_id in set(groups)
+    return False
+
+def _can_use_group_commands(user_id: int, chat_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    managers = load_managers()
+    if str(user_id) in managers.get("managers", {}):
+        groups = managers.get("group_map", {}).get(str(user_id))
+        if groups is None:
+            return True
+        return chat_id in set(groups)
+    return False
+
+def group_period_summary(chat_id: int, period: str, label: str, today: Optional[datetime.date] = None) -> str:
+    data = load_data()
+    all_entries = get_entries_for_period(data, period, today)
+    group_tag = group_business_map.get(chat_id, GROUP_BUSINESS_TAG)
+    group_entries = []
+    for e in all_entries:
+        src = e.get("source", "")
+        if src.startswith(f"group_{chat_id}_"):
+            group_entries.append(e)
+        elif not src and e.get("business") == group_tag:
+            group_entries.append(e)
+    if not group_entries:
+        return f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។"
+    total_usd = sum(e["usd"] for e in group_entries)
+    total_khr = sum(e["khr"] for e in group_entries)
+    count_usd = sum(1 for e in group_entries if e["usd"] > 0)
+    count_khr = sum(1 for e in group_entries if e["khr"] > 0)
+    return (
+        f"📊 សរុប {label} សម្រាប់ក្រុមនេះ៖\n"
+        f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}\n"
+        f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
+    )
+
+# -------------------------------------------------------------------
+# Group payment extraction (single definition)
+# -------------------------------------------------------------------
+def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
+    usd = 0.0
+    khr = 0.0
+    note = ""
+    m = re.search(r"\$(\d+\.?\d*)", text)
+    if m:
+        usd = float(m.group(1))
+    m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
+    if m:
+        usd = float(m.group(1))
+    m = re.search(r"៛\s*([\d,]+)", text)
+    if m:
+        khr = float(m.group(1).replace(",", ""))
+    else:
+        m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
+        if m:
+            khr = float(m.group(1).replace(",", ""))
+    if usd == 0 and khr == 0:
+        return None
+    payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
+    if payer_match:
+        note = payer_match.group(1).strip()
+    if not note:
+        khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
+        if khmer_payer:
+            note = khmer_payer.group(1).strip()
+    if not note:
+        card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
+        if card_match:
+            note = "Card: " + card_match.group(1)
+        else:
+            ref_match = re.search(r"Ref\.ID\s+(\d+)", text, re.IGNORECASE)
+            if ref_match:
+                note = "Ref: " + ref_match.group(1)
+            else:
+                pos_match = re.search(r"POS\s+ID:(\d+)", text, re.IGNORECASE)
+                if pos_match:
+                    note = "POS: " + pos_match.group(1)
+    if not note:
+        note = text.split("\n")[0].strip()[:MAX_NOTE_LEN]
+    trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
+    if trx_match:
+        note += f" (Trx: {trx_match.group(1)})"
+    return usd, khr, note[:MAX_NOTE_LEN]
+
+# -------------------------------------------------------------------
+# Group message handler (with semaphore and add_transaction)
+# -------------------------------------------------------------------
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with _group_semaphore:
+        if not update.message or not update.message.text:
+            return
+        msg = update.message
+        if msg.chat.id not in MONITORED_GROUP_IDS:
+            return
+        if not is_allowed_sender(msg.from_user.id, msg.chat.id):
+            return
+        if _is_rate_limited(msg.from_user.id):
+            return
+        result = extract_group_payment(msg.text)
+        if not result:
+            return
+        usd, khr, note = result
+        trx_id_match = re.search(r"Trx:\s*(\d+)", note)
+        if trx_id_match:
+            trx_id = trx_id_match.group(1)
+            with _seen_trx_lock:
+                if trx_id in SEEN_TRX_IDS:
+                    logger.info("Duplicate Trx. ID %s ignored.", trx_id)
+                    return
+                SEEN_TRX_IDS.add(trx_id)
+        today = datetime.date.today()
+        business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
+        entry = {
+            "date": today.strftime("%Y-%m-%d"),
+            "usd": usd,
+            "khr": khr,
+            "note": note,
+            "category": "other",
+            "business": business_tag,
+            "source": f"group_{msg.chat.id}_msg{msg.message_id}",
+            "tran_id": str(uuid.uuid4())
+        }
+        add_transaction(entry)          # ✅ fast insert
+        append_to_sheet(entry)
+        logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
+                    usd, khr, msg.chat.id, business_tag)
+
+# -------------------------------------------------------------------
+# Owner private message handler (using add_transaction)
+# -------------------------------------------------------------------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("ប្រចាំថ្ងៃ"), KeyboardButton("ប្រចាំសប្ដាហ៍"), KeyboardButton("ប្រចាំខែ")],
@@ -502,13 +703,11 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- Handlers (private) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "👋 សូមស្វាគមន៍! ជ្រើសរើសរបាយការណ៍ ឬផ្ញើការទូទាត់។\n"
-        "សូមវាយ /help សម្រាប់បញ្ជីពាក្យបញ្ជា។",
+        "👋 សូមស្វាគមន៍! ជ្រើសរើសរបាយការណ៍ ឬផ្ញើការទូទាត់។\nសូមវាយ /help សម្រាប់បញ្ជីពាក្យបញ្ជា។",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -563,8 +762,10 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     cat_key = query.data.split("_")[1]
     if cat_key not in CATEGORIES:
         return
-    data[-1]["category"] = cat_key
-    save_data(data)
+    # Update the last entry (most recent)
+    entry = data[-1]
+    entry["category"] = cat_key
+    update_transaction(entry["tran_id"], entry)
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
 
 async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -598,6 +799,7 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not hmac.compare_digest(token, clear_confirmation_token):
         await update.message.reply_text("កូដមិនត្រឹមត្រូវ។ សូមប្រើ `/clear_all` ម្តងទៀត។")
         return
+    # Clear Google Sheets
     sheet = get_sheet()
     if sheet:
         try:
@@ -608,7 +810,11 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error("Failed to clear sheet: %s", e)
             await update.message.reply_text(f"❌ មានបញ្ហាក្នុងការលុប Sheet៖ {e}")
             return
-    save_data([])
+    # Clear SQLite
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM transactions")
+    conn.commit()
+    conn.close()
     save_sync_state({"last_sync": None, "imported_ids": []})
     save_deleted([])
     clear_confirmation_token = None
@@ -810,7 +1016,7 @@ async def permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(f"  {uid}: ក្រុម {groups}")
     await update.message.reply_text("\n".join(lines))
 
-# ---------- Private message handler ----------
+# ---------- Private message handler (manual entry) ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -869,8 +1075,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "business": "manual",
             "tran_id": str(uuid.uuid4())
         }
-        data.append(entry)
-        save_data(data)
+        add_transaction(entry)          # ✅ fast insert
         append_to_sheet(entry)
         parts = []
         if usd:
@@ -970,7 +1175,6 @@ def import_payway_transaction(txn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return entry
 
 def sync_payway_transactions() -> int:
-    data = load_data()
     state = load_sync_state()
     imported_ids = set(state.get("imported_ids", []))
     transactions = fetch_payway_transactions()
@@ -979,12 +1183,11 @@ def sync_payway_transactions() -> int:
         entry = import_payway_transaction(txn)
         if entry is None:
             continue
-        data.append(entry)
+        add_transaction(entry)          # ✅ fast insert
         imported_ids.add(entry["tran_id"])
         added += 1
         append_to_sheet(entry)
     if added > 0:
-        save_data(data)
         state["imported_ids"] = list(imported_ids)
         state["last_sync"] = datetime.datetime.now().isoformat()
         save_sync_state(state)
@@ -1008,173 +1211,7 @@ async def sync_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = f"សមកាលកម្មចុងក្រោយ: {last_sync}" if last_sync else "មិនទាន់បានសមកាលកម្មនៅឡើយទេ។"
     await update.message.reply_text(msg)
 
-# ---------- Group Payment Monitoring ----------
-def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
-    usd = 0.0
-    khr = 0.0
-    note = ""
-    m = re.search(r"\$(\d+\.?\d*)", text)
-    if m:
-        usd = float(m.group(1))
-    m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
-    if m:
-        usd = float(m.group(1))
-    m = re.search(r"៛\s*([\d,]+)", text)
-    if m:
-        khr = float(m.group(1).replace(",", ""))
-    else:
-        m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
-        if m:
-            khr = float(m.group(1).replace(",", ""))
-    if usd == 0 and khr == 0:
-        return None
-    payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
-    if payer_match:
-        note = payer_match.group(1).strip()
-    if not note:
-        khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
-        if khmer_payer:
-            note = khmer_payer.group(1).strip()
-    if not note:
-        card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
-        if card_match:
-            note = "Card: " + card_match.group(1)
-        else:
-            ref_match = re.search(r"Ref\.ID\s+(\d+)", text, re.IGNORECASE)
-            if ref_match:
-                note = "Ref: " + ref_match.group(1)
-            else:
-                pos_match = re.search(r"POS\s+ID:(\d+)", text, re.IGNORECASE)
-                if pos_match:
-                    note = "POS: " + pos_match.group(1)
-    if not note:
-        note = text.split("\n")[0].strip()[:MAX_NOTE_LEN]
-    trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
-    if trx_match:
-        note += f" (Trx: {trx_match.group(1)})"
-    return usd, khr, note[:MAX_NOTE_LEN]
-
-def is_allowed_sender(user_id: int, chat_id: int) -> bool:
-    if allowed_sender_ids:
-        return user_id in allowed_sender_ids
-    if user_id == OWNER_ID:
-        return True
-    managers = load_managers()
-    mgrs = managers.get("managers", {})
-    group_map = managers.get("group_map", {})
-    if str(user_id) in mgrs:
-        groups = group_map.get(str(user_id))
-        if groups is None:
-            return True
-        return chat_id in set(groups)
-    return False
-
-async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-    msg = update.message
-    if msg.chat.id not in MONITORED_GROUP_IDS:
-        return
-    if not is_allowed_sender(msg.from_user.id, msg.chat.id):
-        return
-    if _is_rate_limited(msg.from_user.id):
-        return
-    result = extract_group_payment(msg.text)
-    if not result:
-        return
-    usd, khr, note = result
-    trx_id_match = re.search(r"Trx:\s*(\d+)", note)
-    if trx_id_match:
-        trx_id = trx_id_match.group(1)
-        with _seen_trx_lock:
-            if trx_id in SEEN_TRX_IDS:
-                logger.info("Duplicate Trx. ID %s ignored.", trx_id)
-                return
-            SEEN_TRX_IDS.add(trx_id)
-    today = datetime.date.today()
-    business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
-    data = load_data()
-    entry = {
-        "date": today.strftime("%Y-%m-%d"),
-        "usd": usd,
-        "khr": khr,
-        "note": note,
-        "category": "other",
-        "business": business_tag,
-        "source": f"group_{msg.chat.id}_msg{msg.message_id}",
-        "tran_id": str(uuid.uuid4())
-    }
-    data.append(entry)
-    save_data(data)
-    append_to_sheet(entry)
-    logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
-                usd, khr, msg.chat.id, business_tag)
-
-# ---------- Group period helpers ----------
-def get_entries_for_period(data: List[Dict], period: str, today: Optional[datetime.date] = None) -> List[Dict]:
-    if today is None:
-        today = datetime.date.today()
-    if period == "daily":
-        return [e for e in data if e["date"] == today.strftime("%Y-%m-%d")]
-    elif period == "weekly":
-        week_start = today - datetime.timedelta(days=today.weekday())
-        week_dates = {(week_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
-        return [e for e in data if e["date"] in week_dates]
-    elif period == "monthly":
-        month_prefix = today.strftime("%Y-%m")
-        return [e for e in data if e["date"].startswith(month_prefix)]
-    elif period == "quarterly":
-        quarter = (today.month - 1) // 3 + 1
-        start_month = (quarter - 1) * 3 + 1
-        start_date = datetime.date(today.year, start_month, 1)
-        end_date = today
-        dates = set()
-        d = start_date
-        while d <= end_date:
-            dates.add(d.strftime("%Y-%m-%d"))
-            d += datetime.timedelta(days=1)
-        return [e for e in data if e["date"] in dates]
-    elif period == "yearly":
-        year_prefix = today.strftime("%Y")
-        return [e for e in data if e["date"].startswith(year_prefix)]
-    else:
-        return []
-
-def group_period_summary(chat_id: int, period: str, label: str, today: Optional[datetime.date] = None) -> str:
-    data = load_data()
-    all_entries = get_entries_for_period(data, period, today)
-    group_tag = group_business_map.get(chat_id, GROUP_BUSINESS_TAG)
-    group_entries = []
-    for e in all_entries:
-        src = e.get("source", "")
-        if src.startswith(f"group_{chat_id}_"):
-            group_entries.append(e)
-        elif not src and e.get("business") == group_tag:
-            group_entries.append(e)
-    if not group_entries:
-        return f"គ្មានប្រតិបត្តិការ {label} សម្រាប់ក្រុមនេះទេ។"
-    total_usd = sum(e["usd"] for e in group_entries)
-    total_khr = sum(e["khr"] for e in group_entries)
-    count_usd = sum(1 for e in group_entries if e["usd"] > 0)
-    count_khr = sum(1 for e in group_entries if e["khr"] > 0)
-    return (
-        f"📊 សរុប {label} សម្រាប់ក្រុមនេះ៖\n"
-        f"៛ (KHR): {total_khr:,}   ចំនួន: {count_khr}\n"
-        f"$ (USD): {total_usd:.2f}   ចំនួន: {count_usd}"
-    )
-
-def _can_use_group_commands(user_id: int, chat_id: int) -> bool:
-    if user_id == OWNER_ID:
-        return True
-    managers = load_managers()
-    if str(user_id) in managers.get("managers", {}):
-        groups = managers.get("group_map", {}).get(str(user_id))
-        if groups is None:
-            return True
-        return chat_id in set(groups)
-    return False
-
-# ---------- Group command handlers ----------
+# ---------- Group command handlers (unchanged except using load_data) ----------
 async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
         return
@@ -1365,7 +1402,7 @@ async def group_edit_index_command(update: Update, context: ContextTypes.DEFAULT
     entry["khr"] = new_khr
     if len(context.args) >= 3:
         entry["note"] = " ".join(context.args[2:])[:MAX_NOTE_LEN]
-    save_data(data)
+    update_transaction(entry["tran_id"], entry)
     update_sheet_row_by_tran_id(entry.get("tran_id"), entry)
     await update.message.reply_text(
         f"✅ បានកែប្រែធាតុលេខ {idx}: ពី ${old_usd:.2f} / ៛{old_khr:,} → ${new_usd:.2f} / ៛{new_khr:,} | {entry['note']}"
@@ -1546,7 +1583,7 @@ def group_menu_keyboard():
         [InlineKeyboardButton("❌ បិទ", callback_data="grpmenu_close")]
     ])
 
-# ---------- Owner commands ----------
+# ---------- Owner commands (compare, chart, summary, bysender, undo_delete, duplicates, announce, edit_index, recent, delete_index) ----------
 async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1638,9 +1675,7 @@ async def undo_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     last_deleted = deleted.pop()
     save_deleted(deleted)
-    data = load_data()
-    data.append(last_deleted)
-    save_data(data)
+    add_transaction(last_deleted)          # ✅ restore as new transaction
     append_to_sheet(last_deleted)
     await update.message.reply_text(
         f"✅ បានស្តារធាតុ: {last_deleted.get('note','')} | "
@@ -1733,7 +1768,7 @@ async def edit_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     entry["khr"] = new_khr
     if len(context.args) >= 3:
         entry["note"] = " ".join(context.args[2:])[:MAX_NOTE_LEN]
-    save_data(data)
+    update_transaction(entry["tran_id"], entry)
     update_sheet_row_by_tran_id(entry.get("tran_id"), entry)
     await update.message.reply_text(
         f"✅ បានកែប្រែធាតុលេខ {idx}: ពី ${old_usd:.2f} / ៛{old_khr:,} → ${new_usd:.2f} / ៛{new_khr:,} | {entry['note']}"
@@ -1769,17 +1804,23 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not data or idx < 1 or idx > len(data):
         await update.message.reply_text("លេខមិនត្រឹមត្រូវ ឬគ្មានទិន្នន័យ។")
         return
-    entry = data.pop(len(data) - idx)
-    save_data(data)
-    deleted = load_deleted()
-    deleted.append(entry)
-    save_deleted(deleted)
-    sheet_deleted = delete_sheet_row_by_tran_id(entry.get("tran_id"))
-    msg = f"🗑 បានលុបធាតុលេខ {idx}: {entry.get('note','')} | ${entry.get('usd',0):.2f} / ៛{entry.get('khr',0):,}"
-    msg += "\n✅ ក៏បានលុបពី Google Sheets ផងដែរ។" if sheet_deleted else "\n⚠️ មិនអាចលុបពី Google Sheets ទេ។"
-    await update.message.reply_text(msg)
+    entry = data[len(data) - idx]
+    # Delete from SQLite
+    if delete_transaction(entry["tran_id"]):
+        # Also delete from deleted.json for undo capability
+        deleted = load_deleted()
+        deleted.append(entry)
+        save_deleted(deleted)
+        sheet_deleted = delete_sheet_row_by_tran_id(entry.get("tran_id"))
+        msg = f"🗑 បានលុបធាតុលេខ {idx}: {entry.get('note','')} | ${entry.get('usd',0):.2f} / ៛{entry.get('khr',0):,}"
+        msg += "\n✅ ក៏បានលុបពី Google Sheets ផងដែរ។" if sheet_deleted else "\n⚠️ មិនអាចលុបពី Google Sheets ទេ។"
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("លុបមិនបានសម្រេច។")
 
-# ---------- Background threads (resilient) ----------
+# -------------------------------------------------------------------
+# Background workers (single definitions)
+# -------------------------------------------------------------------
 def sync_worker(bot_token: str) -> None:
     while True:
         try:
@@ -1904,9 +1945,10 @@ def _flush_sheet_queue() -> None:
 import atexit
 atexit.register(_flush_sheet_queue)
 
-# ---------- Build Application ----------
+# -------------------------------------------------------------------
+# Build Application
+# -------------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
 application = (
     Application.builder()
     .token(BOT_TOKEN)
@@ -1973,7 +2015,9 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 LOOP = asyncio.new_event_loop()
 LOOP.run_until_complete(application.initialize())
 
-# ---------- Flask ----------
+# -------------------------------------------------------------------
+# Flask
+# -------------------------------------------------------------------
 flask_app = Flask(__name__)
 
 @flask_app.post("/webhook")
@@ -1984,7 +2028,7 @@ def webhook():
     if payload is None:
         return "Bad Request", 400
     update = Update.de_json(payload, application.bot)
-    LOOP.run_until_complete(application.process_update(update))
+    asyncio.run_coroutine_threadsafe(application.process_update(update), LOOP)
     return "OK"
 
 @flask_app.get("/")
@@ -2013,9 +2057,8 @@ def email_webhook():
     note = str(payload.get("note", ""))[:MAX_NOTE_LEN]
     if usd == 0 and khr == 0:
         return "No amount", 400
-    today = datetime.date.today()
     entry = {
-        "date": today.strftime("%Y-%m-%d"),
+        "date": datetime.date.today().strftime("%Y-%m-%d"),
         "usd": usd,
         "khr": khr,
         "note": note,
@@ -2023,18 +2066,16 @@ def email_webhook():
         "business": PAYWAY_BUSINESS,
         "tran_id": str(uuid.uuid4())
     }
-    data = load_data()
-    data.append(entry)
-    save_data(data)
+    add_transaction(entry)
     append_to_sheet(entry)
     return "OK", 200
 
-# ---------- Start ----------
-try:
-    rebuild_from_sheet()
-except Exception as e:
-    logger.warning("Rebuild skipped due to error: %s", e)
-
+# -------------------------------------------------------------------
+# Startup
+# -------------------------------------------------------------------
+init_db()
+migrate_json_to_sqlite()
+rebuild_from_sheet()
 seed_seen_trx_ids()
 
 threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True).start()
