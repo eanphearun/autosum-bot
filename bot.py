@@ -834,6 +834,8 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
     conn.close()
     save_sync_state({"last_sync": None, "imported_ids": []})
     save_deleted([])
+    with _seen_trx_lock:
+        SEEN_TRX_IDS.clear()
     clear_confirmation_token = None
     clear_confirmation_token_time = None
     await update.message.reply_text("✅ ទិន្នន័យទាំងអស់ត្រូវបានលុបចោលទាំងស្រុង (Google Sheets + local)។")
