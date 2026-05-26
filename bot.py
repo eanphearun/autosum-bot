@@ -605,48 +605,60 @@ def group_period_summary(chat_id: int, period: str, label: str, today: Optional[
 # Group payment extraction (single definition)
 # -------------------------------------------------------------------
 def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
+    """Extract amount (USD/KHR), payer/card info, and transaction ID from various receipt formats."""
     usd = 0.0
-    khr = 0.0
+    khr = 0
     note = ""
-    m = re.search(r"\$(\d+\.?\d*)", text)
-    if m:
-        usd = float(m.group(1))
-    m = re.search(r"SALE\s+(\d+\.?\d*)\s+USD", text, re.IGNORECASE)
-    if m:
-        usd = float(m.group(1))
-    m = re.search(r"៛\s*([\d,]+)", text)
-    if m:
-        khr = float(m.group(1).replace(",", ""))
-    else:
-        m = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
-        if m:
-            khr = float(m.group(1).replace(",", ""))
+
+    # ----- USD extraction -----
+    # Format: $1.87
+    usd_match = re.search(r'\$(\d+\.?\d*)', text)
+    if not usd_match:
+        # Format: SALE 30.00 USD
+        usd_match = re.search(r'SALE\s+(\d+\.?\d*)\s+USD', text, re.IGNORECASE)
+    if not usd_match:
+        # Format: Received 90.00 USD
+        usd_match = re.search(r'Received\s+(\d+\.?\d*)\s+USD', text, re.IGNORECASE)
+    if usd_match:
+        usd = float(usd_match.group(1))
+
+    # ----- KHR extraction -----
+    khr_match = re.search(r'៛\s*([\d,]+)', text)
+    if khr_match:
+        khr = int(khr_match.group(1).replace(',', ''))
+
     if usd == 0 and khr == 0:
         return None
-    payer_match = re.search(r"paid by\s+([A-Za-z\s]+?)(?:\s*\(\*?\d+\))?\s", text, re.IGNORECASE)
+
+    # ----- Note (payer / card / sender) -----
+    # 1. "paid by NAME (*"
+    payer_match = re.search(r'paid by\s+([^(*]+?)\s*\(\*', text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
-    if not note:
-        khmer_payer = re.search(r"ពី\s+([\w\s\u1780-\u17FF]+)", text)
-        if khmer_payer:
-            note = khmer_payer.group(1).strip()
-    if not note:
-        card_match = re.search(r"card\s+(\d+\*+\d+)", text, re.IGNORECASE)
+    else:
+        # 2. "from card XXXX"
+        card_match = re.search(r'from card\s+([\d\*x]+)', text, re.IGNORECASE)
         if card_match:
-            note = "Card: " + card_match.group(1)
+            note = f"Card: {card_match.group(1)}"
         else:
-            ref_match = re.search(r"Ref\.ID\s+(\d+)", text, re.IGNORECASE)
-            if ref_match:
-                note = "Ref: " + ref_match.group(1)
+            # 3. "from 081 *** 862 Men Pechponareay"
+            from_match = re.search(r'from\s+([\d\s\*]+)\s+([A-Za-z\s]+?)(?:,|$)', text, re.IGNORECASE)
+            if from_match:
+                number = from_match.group(1).strip()
+                name = from_match.group(2).strip()
+                note = f"{name} ({number})"
             else:
-                pos_match = re.search(r"POS\s+ID:(\d+)", text, re.IGNORECASE)
-                if pos_match:
-                    note = "POS: " + pos_match.group(1)
-    if not note:
-        note = text.split("\n")[0].strip()[:MAX_NOTE_LEN]
-    trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text, re.IGNORECASE)
+                # Fallback: first 50 characters
+                note = text.split('.')[0].strip()[:MAX_NOTE_LEN]
+
+    # ----- Transaction ID (Trx. ID: or Ref.ID:) -----
+    trx_match = re.search(r'Trx\.\s*ID:\s*(\d+)', text, re.IGNORECASE)
+    if not trx_match:
+        trx_match = re.search(r'Ref\.ID:?\s+(\d+)', text, re.IGNORECASE)
     if trx_match:
-        note += f" (Trx: {trx_match.group(1)})"
+        trx_id = trx_match.group(1)
+        note += f" (Trx: {trx_id})"
+
     return usd, khr, note[:MAX_NOTE_LEN]
 
 # -------------------------------------------------------------------
