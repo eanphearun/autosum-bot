@@ -215,22 +215,6 @@ def get_all_businesses_sheet():
         logger.error(f"Error opening '{ALL_BUSINESSES_SHEET}': {e}")
         return None
 
-#def append_to_business_sheet(entry: dict, row: list) -> None:
-    """Write a copy of the row to the single 'All Businesses' sheet."""
-    # Only write if the entry has a business tag different from 'manual'?
-    # We'll write everything with a business tag (including manual, group, etc.)
-    biz_sheet = get_all_businesses_sheet()
-    if not biz_sheet:
-        return
-    try:
-        # Add the business tag as a new column (or reuse an existing one?)
-        # The master sheet row already has columns A-H. We'll append the same row + business tag again? 
-        # Actually the row already contains the business in column F. So we can just append the same row.
-        # But to make it clearer, we can add a duplicate row; it's fine.
-        biz_sheet.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        logger.error(f"All Businesses sheet write failed: {e}")
-
 def delete_sheet_row_by_tran_id(tran_id: str) -> bool:
     if not tran_id:
         return False
