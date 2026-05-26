@@ -2045,7 +2045,7 @@ def webhook():
     if payload is None:
         return "Bad Request", 400
     update = Update.de_json(payload, application.bot)
-    asyncio.run_coroutine_threadsafe(application.process_update(update), LOOP)
+    LOOP.run_until_complete(application.process_update(update))
     return "OK"
 
 @flask_app.get("/")
