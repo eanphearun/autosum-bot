@@ -40,7 +40,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # -------------------------------------------------------------------
-# Logging & configuration
+# Logging & configuration (shared)
 # -------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +49,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global flags
+# -------------------------------------------------------------------
+# AutoSum Bot Configuration
+# -------------------------------------------------------------------
 clear_confirmation_token = None
 clear_confirmation_token_time: Optional[float] = None
 CLEAR_TOKEN_TTL = 120
@@ -58,19 +60,16 @@ sheet_queue = queue.Queue()
 SEEN_TRX_IDS: Set[str] = set()
 _seen_trx_lock = threading.Lock()
 
-# Rate limiting
 _rate_limit_lock = threading.Lock()
 _user_msg_times: Dict[int, List[float]] = defaultdict(list)
 RATE_LIMIT_MAX = 20
 RATE_LIMIT_WINDOW = 60
 
-# Concurrency limit for group messages
 _group_semaphore = asyncio.Semaphore(5)
 
 MAX_NOTE_LEN = 200
 MAX_WEBHOOK_BODY = 64 * 1024
 
-# Environment variables
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 MANAGER_IDS: Set[int] = set()
@@ -157,7 +156,7 @@ DB_FILE = "income.db"
 ALL_BUSINESSES_SHEET = f"{SHEET_NAME} - All Businesses"
 
 # -------------------------------------------------------------------
-# SQLite helpers
+# SQLite helpers (AutoSum)
 # -------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -234,7 +233,6 @@ def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> b
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # Duplicate PayWay transaction – silently ignore
         return False
     finally:
         conn.close()
@@ -301,7 +299,7 @@ def save_deleted(deleted: List[Dict[str, Any]]) -> None:
         json.dump(deleted, f, ensure_ascii=False, indent=2)
 
 # -------------------------------------------------------------------
-# Google Sheets helpers
+# Google Sheets helpers (AutoSum)
 # -------------------------------------------------------------------
 _SHEET_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 def _sanitise_sheet_value(value: str) -> str:
@@ -318,6 +316,34 @@ def get_sheet():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME).sheet1
+
+def write_master_sheet_row(entry: dict) -> bool:
+    sheet = get_sheet()
+    if not sheet:
+        return False
+    now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+    if "tran_id" not in entry:
+        entry["tran_id"] = str(uuid.uuid4())
+    row = [
+        _sanitise_sheet_value(entry.get("date", "")),
+        entry.get("usd", 0),
+        entry.get("khr", 0),
+        _sanitise_sheet_value(CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ")),
+        _sanitise_sheet_value(entry.get("note", "")),
+        _sanitise_sheet_value(entry.get("business", "")),
+        now,
+        entry["tran_id"],
+        entry.get("payway_trx_id", "")
+    ]
+    for attempt in range(3):
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+            logger.info("Sheet write (sync): %s", entry.get('note','')[:30])
+            return True
+        except Exception as e:
+            logger.warning("Sheet write attempt %d failed: %s", attempt+1, e)
+            time.sleep(2)
+    return False
 
 def append_to_sheet(entry: dict) -> None:
     if not GSPREAD_CREDENTIALS_JSON:
@@ -340,37 +366,6 @@ def append_to_sheet(entry: dict) -> None:
         sheet_queue.put((entry, row))
     except Exception as e:
         logger.error("Failed to queue sheet row: %s", e)
-
-def write_master_sheet_row(entry: dict) -> bool:
-    """Write a single row to the master sheet synchronously, with retries.
-    Returns True if successful, False otherwise."""
-    sheet = get_sheet()
-    if not sheet:
-        return False
-    now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
-    if "tran_id" not in entry:
-        entry["tran_id"] = str(uuid.uuid4())
-    row = [
-        _sanitise_sheet_value(entry.get("date", "")),
-        entry.get("usd", 0),
-        entry.get("khr", 0),
-        _sanitise_sheet_value(CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ")),
-        _sanitise_sheet_value(entry.get("note", "")),
-        _sanitise_sheet_value(entry.get("business", "")),
-        now,
-        entry["tran_id"],
-        entry.get("payway_trx_id", "")
-    ]
-    # Try up to 3 times with a short delay
-    for attempt in range(3):
-        try:
-            sheet.append_row(row, value_input_option="USER_ENTERED")
-            logger.info("Sheet write (sync): %s", entry.get('note','')[:30])
-            return True
-        except Exception as e:
-            logger.warning("Sheet write attempt %d failed: %s", attempt+1, e)
-            time.sleep(2)
-    return False
 
 def get_all_businesses_sheet():
     if not GSPREAD_CREDENTIALS_JSON:
@@ -447,13 +442,13 @@ def rebuild_from_sheet() -> None:
             note_val = row[4] if len(row) > 4 else ""
             business_val = row[5] if len(row) > 5 else "manual"
             tran_id_val = row[7] if len(row) > 7 else str(uuid.uuid4())
-            payway_trx_val = row[8] if len(row) > 8 else ""   # new column I
+            payway_trx_val = row[8] if len(row) > 8 else ""
             cur.execute(
                 "INSERT INTO transactions (id, date, usd, khr, category, note, business, timestamp, payway_trx_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (tran_id_val, date_val, usd_val, khr_val, category_val.lower(),
-                note_val[:MAX_NOTE_LEN], business_val,
-                datetime.datetime.now().isoformat(), payway_trx_val or None)
+                 note_val[:MAX_NOTE_LEN], business_val,
+                 datetime.datetime.now().isoformat(), payway_trx_val or None)
             )
             imported_ids.add(tran_id_val)
         conn.commit()
@@ -467,7 +462,6 @@ def rebuild_from_sheet() -> None:
         logger.error("Rebuild failed: %s", e)
 
 def seed_seen_trx_ids() -> None:
-    """Load all previously seen PayWay Trx. IDs from the SQLite database."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT payway_trx_id FROM transactions WHERE payway_trx_id IS NOT NULL")
@@ -477,7 +471,7 @@ def seed_seen_trx_ids() -> None:
     conn.close()
 
 # -------------------------------------------------------------------
-# Core helper functions
+# Core helper functions (AutoSum)
 # -------------------------------------------------------------------
 def extract_amounts(text: str) -> Tuple[float, float, str]:
     khr_match = re.search(r"ចំនួន\s*([\d,]+)\s*រៀល", text)
@@ -647,74 +641,55 @@ def group_period_summary(chat_id: int, period: str, label: str, today: Optional[
     )
 
 # -------------------------------------------------------------------
-# Group payment extraction (single definition)
+# Group payment extraction (AutoSum)
 # -------------------------------------------------------------------
 def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
-    """Extract amount (USD/KHR), payer/card info, and transaction ID from various receipt formats."""
     usd = 0.0
     khr = 0
     note = ""
-
-    # ----- USD extraction -----
-    # Format: $1.87
     usd_match = re.search(r'\$(\d+\.?\d*)', text)
     if not usd_match:
-        # Format: SALE 30.00 USD
         usd_match = re.search(r'SALE\s+(\d+\.?\d*)\s+USD', text, re.IGNORECASE)
     if not usd_match:
-        # Format: Received 90.00 USD
         usd_match = re.search(r'Received\s+(\d+\.?\d*)\s+USD', text, re.IGNORECASE)
     if usd_match:
         usd = float(usd_match.group(1))
-
-    # ----- KHR extraction -----
     khr_match = re.search(r'៛\s*([\d,]+)', text)
     if khr_match:
         khr = int(khr_match.group(1).replace(',', ''))
-
     if usd == 0 and khr == 0:
         return None
-
-    # ----- Note (payer / card / sender) -----
-    # 1. "paid by NAME (*"
     payer_match = re.search(r'paid by\s+([^(*]+?)\s*\(\*', text, re.IGNORECASE)
     if payer_match:
         note = payer_match.group(1).strip()
     else:
-        # 2. "from card XXXX"
         card_match = re.search(r'from card\s+([\d\*x]+)', text, re.IGNORECASE)
         if card_match:
             note = f"Card: {card_match.group(1)}"
         else:
-            # 3. "from 081 *** 862 Men Pechponareay"
             from_match = re.search(r'from\s+([\d\s\*]+)\s+([A-Za-z\s]+?)(?:,|$)', text, re.IGNORECASE)
             if from_match:
                 number = from_match.group(1).strip()
                 name = from_match.group(2).strip()
                 note = f"{name} ({number})"
             else:
-                # Fallback: first 50 characters
                 note = text.split('.')[0].strip()[:MAX_NOTE_LEN]
-
-    # ----- Transaction ID (Trx. ID: or Ref.ID:) -----
     trx_match = re.search(r'Trx\.\s*ID:\s*(\d+)', text, re.IGNORECASE)
     if not trx_match:
         trx_match = re.search(r'Ref\.ID:?\s+(\d+)', text, re.IGNORECASE)
     if trx_match:
         trx_id = trx_match.group(1)
         note += f" (Trx: {trx_id})"
-
     return usd, khr, note[:MAX_NOTE_LEN]
 
 # -------------------------------------------------------------------
-# Group message handler (with semaphore and add_transaction)
+# Group message handler (AutoSum)
 # -------------------------------------------------------------------
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message and update.message.text:
         logger.info("📨 GROUP MSG: chat_id=%s, text=%s", update.message.chat.id, update.message.text[:200])
     else:
         logger.info("📨 GROUP MSG: no text")
-
     async with _group_semaphore:
         if not update.message or not update.message.text:
             return
@@ -725,25 +700,17 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if _is_rate_limited(msg.from_user.id):
             return
-
         result = extract_group_payment(msg.text)
         if not result:
             return
         usd, khr, note = result
-
-        # Extract PayWay transaction ID (if present) from the note
         trx_id_match = re.search(r"Trx:\s*(\d+)", note)
         payway_id = trx_id_match.group(1) if trx_id_match else None
-
-        # Quick in‑memory duplicate check (optional but fast)
         if payway_id:
             with _seen_trx_lock:
                 if payway_id in SEEN_TRX_IDS:
                     logger.info("Duplicate Trx. ID %s ignored (memory).", payway_id)
                     return
-                # We'll add it only after successful DB insert
-
-        # Build the entry
         today = datetime.date.today()
         business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
         entry = {
@@ -757,24 +724,19 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "tran_id": str(uuid.uuid4()),
             "payway_trx_id": payway_id or ""
         }
-
-        # Try to insert – add_transaction returns False if duplicate
         if not add_transaction(entry, payway_id):
             logger.info("Duplicate Trx. ID %s ignored (DB).", payway_id)
             return
-
-        # Success – now safe to add to memory and queue sheet write
         if payway_id:
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
-
         write_master_sheet_row(entry)
         append_to_sheet(entry)
         logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
                     usd, khr, msg.chat.id, business_tag)
 
 # -------------------------------------------------------------------
-# Owner private message handler (using add_transaction)
+# AutoSum command handlers (the full list)
 # -------------------------------------------------------------------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -827,6 +789,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/search <keyword> – ស្វែងរកតាមចំណាំ\n"
         "/top [n] – ប្រតិបត្តិការធំជាងគេ\n"
         "/range YYYY-MM-DD YYYY-MM-DD – របាយការណ៍ជួរកាលបរិច្ឆេទ\n"
+        "/force_sync – បង្ខំសមកាលកម្មទៅ Google Sheets\n"
+        "/sheet_test – សាកល្បងការតភ្ជាប់ Sheet\n"
+        "/check_rebuild – ពិនិត្យការស្ថាបនាឡើងវិញ\n"
         "ប៊ូតុង៖ ប្រចាំថ្ងៃ, ប្រចាំសប្ដាហ៍, ប្រចាំខែ, កំណត់ប្រភេទ"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -843,10 +808,8 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     cat_key = query.data.split("_")[1]
     if cat_key not in CATEGORIES:
         return
-    # Update the last entry (most recent)
-    entry = data[-1]
-    entry["category"] = cat_key
-    update_transaction(entry["tran_id"], entry)
+    data[-1]["category"] = cat_key
+    update_transaction(data[-1]["tran_id"], data[-1])
     await query.edit_message_text(f"✅ បានកំណត់ប្រភេទ: {CATEGORIES[cat_key]}")
 
 async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -880,7 +843,6 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not hmac.compare_digest(token, clear_confirmation_token):
         await update.message.reply_text("កូដមិនត្រឹមត្រូវ។ សូមប្រើ `/clear_all` ម្តងទៀត។")
         return
-    # Clear Google Sheets
     sheet = get_sheet()
     if sheet:
         try:
@@ -891,7 +853,6 @@ async def confirm_clear_command(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error("Failed to clear sheet: %s", e)
             await update.message.reply_text(f"❌ មានបញ្ហាក្នុងការលុប Sheet៖ {e}")
             return
-    # Clear SQLite
     conn = sqlite3.connect(DB_FILE)
     conn.execute("DELETE FROM transactions")
     conn.commit()
@@ -1007,38 +968,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
     await update.message.reply_text("\n".join(lines))
 
-async def force_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != OWNER_ID:
-        return
-    data = load_data()
-    if not data:
-        await update.message.reply_text("គ្មានទិន្នន័យដើម្បីធ្វើសមកាលកម្មទេ។")
-        return
-    sheet = get_sheet()
-    if not sheet:
-        await update.message.reply_text("Sheet មិនអាចចូលប្រើបានទេ។")
-        return
-    count = 0
-    for entry in data:
-        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
-        row = [
-            entry.get("date", ""),
-            entry.get("usd", 0),
-            entry.get("khr", 0),
-            CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ"),
-            entry.get("note", ""),
-            entry.get("business", ""),
-            now,
-            entry.get("tran_id", ""),
-            entry.get("payway_trx_id", "")
-        ]
-        try:
-            sheet.append_row(row, value_input_option="USER_ENTERED")
-            count += 1
-        except Exception as e:
-            logger.error("Force sync row error: %s", e)
-    await update.message.reply_text(f"✅ បានធ្វើសមកាលកម្ម {count} ធាតុទៅ Google Sheets។")
-
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1084,48 +1013,6 @@ async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     MANUAL_LOCKED = False
     await update.message.reply_text("🔓 ការកត់ត្រាដោយដៃត្រូវបានដោះសោ។")
 
-async def sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != OWNER_ID:
-        return
-    try:
-        sheet = get_sheet()
-        if not sheet:
-            await update.message.reply_text("❌ Master sheet not found. Check SHEET_NAME and sharing.")
-            return
-        # Write a test row directly (bypass queue)
-        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
-        row = ["TEST", 0, 0, "💸 ផ្សេងៗ", "Sheet health check", "manual", now, str(uuid.uuid4()), ""]
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-        await update.message.reply_text("✅ Master sheet is accessible and test row written.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Sheet error: {e}")
-
-async def check_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != OWNER_ID:
-        return
-    sheet = get_sheet()
-    if not sheet:
-        await update.message.reply_text("❌ Master sheet not found.")
-        return
-    try:
-        rows = sheet.get_all_values()
-        await update.message.reply_text(f"📊 Sheet has {len(rows)} rows (including header).")
-        if len(rows) > 1:
-            # Show first and last data rows (truncated)
-            first = rows[1] if len(rows) > 1 else ["-"]
-            last = rows[-1] if len(rows) > 1 else ["-"]
-            await update.message.reply_text(
-                f"First data row (truncated): {first[0]}, {first[1]}, {first[2]}, {first[3]}, {first[4][:30]}, {first[5]}, {first[7]}, {first[8] if len(first)>8 else 'N/A'}\n"
-                f"Last data row (truncated): {last[0]}, {last[1]}, {last[2]}, {last[3]}, {last[4][:30]}, {last[5]}, {last[7]}, {last[8] if len(last)>8 else 'N/A'}"
-            )
-        # Trigger the rebuild manually
-        rebuild_from_sheet()
-        data = load_data()
-        await update.message.reply_text(f"🔄 Rebuild complete. Current database has {len(data)} entries.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-# ---------- Manager management ----------
 async def add_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1172,7 +1059,6 @@ async def permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(f"  {uid}: ក្រុម {groups}")
     await update.message.reply_text("\n".join(lines))
 
-# ---------- Private message handler (manual entry) ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1183,7 +1069,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     today = datetime.date.today()
     data = load_data()
 
-    # Report buttons (bypass lock)
     if text == "ប្រចាំថ្ងៃ":
         date_str = today.strftime("%Y-%m-%d")
         entries = [e for e in data if e["date"] == date_str]
@@ -1210,24 +1095,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("ជ្រើសរើសប្រភេទសម្រាប់ធាតុចុងក្រោយ៖", reply_markup=keyboard)
         return
 
-    # ----- Manual entry (with lock & duplicate prevention) -----
     usd, khr, note = extract_amounts(text)
     if usd or khr:
-        # Extract PayWay transaction ID from raw message
         trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text)
         payway_id = trx_match.group(1) if trx_match else None
-
-        # Quick in‑memory duplicate check (optional but fast)
         if payway_id:
             with _seen_trx_lock:
                 if payway_id in SEEN_TRX_IDS:
                     await update.message.reply_text("⏭ ប្រតិបត្តិការនេះបានកត់ត្រារួចហើយ (Trx. ID ដូចគ្នា)។")
                     return
-                # We'll add it to SEEN_TRX_IDS only after successful DB insert below
         if MANUAL_LOCKED:
             await update.message.reply_text("⛔ ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។ សូមទាក់ទងម្ចាស់។")
             return
-
         entry = {
             "date": today.strftime("%Y-%m-%d"),
             "usd": usd,
@@ -1238,16 +1117,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "tran_id": str(uuid.uuid4()),
             "payway_trx_id": payway_id or ""
         }
-        # add_transaction returns False if duplicate (DB constraint)
         if not add_transaction(entry, payway_id):
             await update.message.reply_text("⏭ ប្រតិបត្តិការនេះមានរួចហើយ (Trx. ID ដូចគ្នា)។")
             return
-
-        # Now it's safe to add to in‑memory set
         if payway_id:
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
-
         write_master_sheet_row(entry)
         append_to_sheet(entry)
         parts = []
@@ -1311,7 +1186,7 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     buf.name = f"export_{datetime.date.today().isoformat()}.csv"
     await update.message.reply_document(document=buf)
 
-# ---------- PayWay Sync ----------
+# PayWay sync functions (unchanged)
 def fetch_payway_transactions() -> List[Dict[str, Any]]:
     if not PAYWAY_MERCHANT_ID or not PAYWAY_API_KEY:
         return []
@@ -1343,11 +1218,13 @@ def import_payway_transaction(txn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "note": description,
         "category": "other",
         "business": PAYWAY_BUSINESS,
-        "tran_id": txn_id
+        "tran_id": txn_id,
+        "payway_trx_id": txn_id
     }
     return entry
 
 def sync_payway_transactions() -> int:
+    data = load_data()
     state = load_sync_state()
     imported_ids = set(state.get("imported_ids", []))
     transactions = fetch_payway_transactions()
@@ -1356,9 +1233,10 @@ def sync_payway_transactions() -> int:
         entry = import_payway_transaction(txn)
         if entry is None:
             continue
-        add_transaction(entry)          # ✅ fast insert
+        # Insert directly into SQLite
+        add_transaction(entry, entry.get("payway_trx_id"))
         imported_ids.add(entry["tran_id"])
-        added += 1 
+        added += 1
         write_master_sheet_row(entry)
         append_to_sheet(entry)
     if added > 0:
@@ -1385,7 +1263,7 @@ async def sync_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = f"សមកាលកម្មចុងក្រោយ: {last_sync}" if last_sync else "មិនទាន់បានសមកាលកម្មនៅឡើយទេ។"
     await update.message.reply_text(msg)
 
-# ---------- Group command handlers (unchanged except using load_data) ----------
+# Group commands
 async def group_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.id not in MONITORED_GROUP_IDS:
         return
@@ -1757,7 +1635,7 @@ def group_menu_keyboard():
         [InlineKeyboardButton("❌ បិទ", callback_data="grpmenu_close")]
     ])
 
-# ---------- Owner commands (compare, chart, summary, bysender, undo_delete, duplicates, announce, edit_index, recent, delete_index) ----------
+# Owner commands (compare, chart, summary, bysender, undo_delete, duplicates, announce, edit_index, recent, delete_index, force_sync, sheet_test, check_rebuild)
 async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1849,7 +1727,9 @@ async def undo_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     last_deleted = deleted.pop()
     save_deleted(deleted)
-    add_transaction(last_deleted)          # ✅ restore as new transaction
+    # Re-insert the entry into the database
+    add_transaction(last_deleted)
+    write_master_sheet_row(last_deleted)
     append_to_sheet(last_deleted)
     await update.message.reply_text(
         f"✅ បានស្តារធាតុ: {last_deleted.get('note','')} | "
@@ -1981,7 +1861,7 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     entry = data[len(data) - idx]
     # Delete from SQLite
     if delete_transaction(entry["tran_id"]):
-        # Also delete from deleted.json for undo capability
+        # Save to deleted stack for undo
         deleted = load_deleted()
         deleted.append(entry)
         save_deleted(deleted)
@@ -1992,8 +1872,695 @@ async def delete_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         await update.message.reply_text("លុបមិនបានសម្រេច។")
 
+async def force_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    data = load_data()
+    if not data:
+        await update.message.reply_text("គ្មានទិន្នន័យដើម្បីធ្វើសមកាលកម្មទេ។")
+        return
+    sheet = get_sheet()
+    if not sheet:
+        await update.message.reply_text("Sheet មិនអាចចូលប្រើបានទេ។")
+        return
+    count = 0
+    for entry in data:
+        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            entry.get("date", ""),
+            entry.get("usd", 0),
+            entry.get("khr", 0),
+            CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ"),
+            entry.get("note", ""),
+            entry.get("business", ""),
+            now,
+            entry.get("tran_id", ""),
+            entry.get("payway_trx_id", "")
+        ]
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+            count += 1
+        except Exception as e:
+            logger.error("Force sync row error: %s", e)
+    await update.message.reply_text(f"✅ បានធ្វើសមកាលកម្ម {count} ធាតុទៅ Google Sheets។")
+
+async def sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            await update.message.reply_text("❌ Master sheet not found. Check SHEET_NAME and sharing.")
+            return
+        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+        row = ["TEST", 0, 0, "💸 ផ្សេងៗ", "Sheet health check", "manual", now, str(uuid.uuid4()), ""]
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        await update.message.reply_text("✅ Master sheet is accessible and test row written.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Sheet error: {e}")
+
+async def check_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    sheet = get_sheet()
+    if not sheet:
+        await update.message.reply_text("❌ Master sheet not found.")
+        return
+    try:
+        rows = sheet.get_all_values()
+        await update.message.reply_text(f"📊 Sheet has {len(rows)} rows (including header).")
+        if len(rows) > 1:
+            first = rows[1] if len(rows) > 1 else ["-"]
+            last = rows[-1] if len(rows) > 1 else ["-"]
+            await update.message.reply_text(
+                f"First data row (truncated): {first[0]}, {first[1]}, {first[2]}, {first[3]}, {first[4][:30]}, {first[5]}, {first[7]}, {first[8] if len(first)>8 else 'N/A'}\n"
+                f"Last data row (truncated): {last[0]}, {last[1]}, {last[2]}, {last[3]}, {last[4][:30]}, {last[5]}, {last[7]}, {last[8] if len(last)>8 else 'N/A'}"
+            )
+        rebuild_from_sheet()
+        data = load_data()
+        await update.message.reply_text(f"🔄 Rebuild complete. Current database has {len(data)} entries.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 # -------------------------------------------------------------------
-# Background workers (single definitions)
+# Profile Bot (raw requests)
+# -------------------------------------------------------------------
+PROFILE_BOT_TOKEN = os.environ.get("PROFILE_BOT_TOKEN", "")
+PROFILE_OWNER_ID = int(os.environ.get("PROFILE_OWNER_ID", 0))
+
+if PROFILE_BOT_TOKEN:
+    def profile_send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+        url = f"https://api.telegram.org/bot{PROFILE_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return requests.post(url, json=payload, timeout=10)
+
+    def profile_answer_callback(callback_id, text=None):
+        url = f"https://api.telegram.org/bot{PROFILE_BOT_TOKEN}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        requests.post(url, json=payload, timeout=10)
+
+    PROFILE_BIRD_BOT_LINK = "https://t.me/bird_nest_house_bot"
+    PROFILE_FUNNEL_BOT_LINK = "https://t.me/birdnest_funnel_bot"
+
+    def profile_main_keyboard():
+        return {
+            "inline_keyboard": [
+                [{"text": "🛒 បើក Mini App ទិញទំនិញ", "url": PROFILE_BIRD_BOT_LINK}],
+                [{"text": "📖 របៀបប្រើ Mini App", "callback_data": "tutorial_start"}],
+                [{"text": "📦 សាកសួរបោះដុំ", "callback_data": "wholesale"}],
+                [{"text": "💬 និយាយជាមួយបុគ្គលិក", "callback_data": "human"}],
+                [{"text": "🟢 ចាប់ផ្តើមបញ្ជាទិញរហ័ស", "url": PROFILE_FUNNEL_BOT_LINK}]
+            ]
+        }
+
+    def tutorial_nav_keyboard(step, max_step):
+        buttons = []
+        if step > 1:
+            buttons.append({"text": "⬅ ត្រឡប់ក្រោយ", "callback_data": f"tutorial_{step-1}"})
+        if step < max_step:
+            buttons.append({"text": "បន្ទាប់ ➡", "callback_data": f"tutorial_{step+1}"})
+        return {"inline_keyboard": [buttons, [{"text": "❌ បិទមេរៀន", "callback_data": "tutorial_close"}]]}
+
+    TUTORIAL_TEXTS = {
+        1: (
+            "📖 *មេរៀនទី១៖ ស្វាគមន៍!*\n\n"
+            "🍃 *សំបុកត្រចៀកកាំ Bird Nest House* ជាហាងផលិតផលត្រចៀកកាំ!\n"
+            "យើងផ្តល់ជូនការបញ្ជាទិញតាម Telegram Mini App ដែលងាយស្រួល និងមានប្រម៉ូសិនពិសេសៗជាច្រើន។\n\n"
+            "📌 *ហេតុអ្វីត្រូវប្រើ Mini App?*\n"
+            "• បញ្ជាទិញដោយមិនចាំបាច់ទាក់ទងផ្ទាល់\n"
+            "• មានពិន្ទុសន្សំ បញ្ចុះតម្លៃ\n"
+            "• ការដឹកជញ្ជូនឥតគិតថ្លៃលើសពី ៣០ដុល្លារក្នុងក្រុង\n"
+            "• ការទូទាត់ងាយស្រួលតាម KHQR / សាច់ប្រាក់\n\n"
+            "ចុច *បន្ទាប់ ➡* ដើម្បីមើលជំហានបន្ត។"
+        ),
+        2: (
+            "📖 *មេរៀនទី២៖ ចាប់ផ្តើម*\n\n"
+            "1. ចុចលើប៊ូតុង *ចាប់ផ្តើម* នៅក្នុង @bird_nest_house_bot\n"
+            "2. រួចចុច *🍽️ Open Order Menu* ដើម្បីបើក Mini App\n\n"
+            "👉 អ្នកក៏អាចចុច *🛒 បើក Mini App* ខាងក្រោមដោយផ្ទាល់។"
+        ),
+        3: (
+            "📖 *មេរៀនទី៣៖ ជ្រើសរើសផលិតផល*\n\n"
+            "នៅក្នុង Mini App អ្នកនឹងឃើញ៖\n"
+            "• 🥤 ទឹកត្រចៀកកាំ (75ml, 100ml, 150ml...)\n"
+            "• 🥚 សំបុកត្រចៀកកាំស្ងួត (ថ្នាក់ A, Konkat)\n"
+            "• 🎁 ឈុតអំណោយ\n\n"
+            "អ្នកអាចស្វែងរក ឬជ្រើសរើសតាមប្រភេទ។\n"
+            "ផលិតផលដែលមានប្រម៉ូសិននឹងបង្ហាញផ្លាក *\"-10% OFF\"* ជាដើម។"
+        ),
+        4: (
+            "📖 *មេរៀនទី៤៖ ដាក់ក្នុងកន្ត្រក និងប្រើពិន្ទុ*\n\n"
+            "• ចុច '+' ដើម្បីបង្កើនចំនួន\n"
+            "• ចុច 'Add to Cart' ដើម្បីបញ្ចូល\n"
+            "• នៅផ្ទាំង 🛒 Cart អ្នកអាចឃើញសរុបថ្លៃ ការបញ្ចុះតម្លៃ និងថ្លៃដឹក។\n"
+            "• បើមានពិន្ទុគ្រប់ អ្នកអាចធីកប្រើពិន្ទុដើម្បីបញ្ចុះតម្លៃ (100pts = $1)។"
+        ),
+        5: (
+            "📖 *មេរៀនទី៥៖ បញ្ជាទិញ និងទូទាត់*\n\n"
+            "• ជ្រើសរើសពេលវេលាដឹកជញ្ជូន\n"
+            "• ចុច 'Proceed to Payment'\n"
+            "• ជ្រើសរើសវិធីទូទាត់៖ KHQR / សាច់ប្រាក់ / កាត\n"
+            "• បើជ្រើស KHQR សូមស្កេន QR និងផ្ទេរប្រាក់\n"
+            "• ចុច 'I've Paid — Confirm Order'\n\n"
+            "✅ ការបញ្ជាទិញរបស់អ្នកត្រូវបានបញ្ជូនទៅអ្នកលក់ហើយ!\n"
+            "សូមចាំថា អ្នកអាចជជែកជាមួយអ្នកលក់បានគ្រប់ពេល។"
+        )
+    }
+    MAX_TUTORIAL = 5
+
+    profile_user_state = {}
+    profile_tutorial_step = {}
+    PROFILE_CURRENT_MODE = "business"
+
+    def profile_process_message(chat_id, text, user_first_name, user_username):
+        if chat_id == PROFILE_OWNER_ID:
+            return
+        if chat_id in profile_user_state:
+            profile_handle_wholesale_step(chat_id, text, user_first_name, user_username)
+            return
+        if PROFILE_CURRENT_MODE == "business":
+            profile_send_message(
+                chat_id,
+                f"សួស្ដី {user_first_name}! 👋\n\n"
+                "ខ្ញុំជាជំនួយការរបស់លោកភារុន *ផ្ទះត្រចៀកកាំ Bird Nest House*។\n"
+                "ខាងក្រោមនេះជាជម្រើសដែលអ្នកអាចជ្រើសរើស៖",
+                reply_markup=profile_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            profile_send_message(
+                chat_id,
+                "👋 សួស្តី! ខ្ញុំឃើញសាររបស់អ្នក – ខ្ញុំនឹងឆ្លើយតបវិញភ្លាមៗពេលទំនេរ។\n"
+                "បើបន្ទាន់ សូមផ្ញើ 🔥 មក។"
+            )
+
+    def profile_handle_wholesale_step(chat_id, text, first_name, username):
+        state = profile_user_state[chat_id]
+        step = state["step"]
+        if step == "ask_name":
+            state["name"] = text.strip()
+            state["step"] = "ask_company"
+            profile_send_message(chat_id, "អរគុណ! តើឈ្មោះក្រុមហ៊ុនរបស់អ្នកជាអ្វី?")
+        elif step == "ask_company":
+            state["company"] = text.strip()
+            state["step"] = "ask_quantity"
+            profile_send_message(chat_id, "តើអ្នកត្រូវការក្នុងបរិមាណប៉ុន្មានក្នុងមួយខែ?")
+        elif step == "ask_quantity":
+            state["quantity"] = text.strip()
+            summary = (
+                f"📦 *អតិថិជនបោះដុំថ្មី*\n"
+                f"ឈ្មោះ: {state.get('name')}\n"
+                f"ក្រុមហ៊ុន: {state.get('company')}\n"
+                f"បរិមាណប៉ាន់ស្មាន: {state.get('quantity')}\n"
+                f"លេខសម្គាល់: `{chat_id}`"
+                f"{(' @' + username) if username else ''}"
+            )
+            profile_send_message(PROFILE_OWNER_ID, summary, parse_mode="Markdown")
+            profile_send_message(chat_id, "✅ អរគុណ! សំណើរបស់អ្នកត្រូវបានបញ្ជូនទៅម្ចាស់ហាង។ ពួកគេនឹងទាក់ទងអ្នកឆាប់ៗនេះ។")
+            del profile_user_state[chat_id]
+
+    def profile_handle_callback(callback):
+        data = callback["data"]
+        cb_id = callback["id"]
+        msg = callback.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        user_info = callback.get("from", {})
+        first_name = user_info.get("first_name", "អ្នក")
+
+        if data.startswith("tutorial_"):
+            if data == "tutorial_start":
+                profile_tutorial_step[chat_id] = 1
+                step = 1
+            elif data == "tutorial_close":
+                profile_tutorial_step.pop(chat_id, None)
+                profile_send_message(chat_id, "មេរៀនត្រូវបានបិទ។ អ្នកអាចចុចប៊ូតុងណាមួយខាងក្រោម។", reply_markup=profile_main_keyboard())
+                profile_answer_callback(cb_id)
+                return
+            else:
+                step = int(data.split("_")[1])
+                profile_tutorial_step[chat_id] = step
+            text = TUTORIAL_TEXTS.get(step, "មិនមានមេរៀននេះទេ")
+            profile_send_message(chat_id, text, reply_markup=tutorial_nav_keyboard(step, MAX_TUTORIAL), parse_mode="Markdown")
+            profile_answer_callback(cb_id)
+            return
+
+        if data == "wholesale":
+            profile_user_state[chat_id] = {"step": "ask_name"}
+            profile_send_message(chat_id, "📋 តោះបង្កើតគណនីបោះដុំ។ សូមប្រាប់ឈ្មោះពេញរបស់អ្នក។")
+            profile_answer_callback(cb_id)
+            return
+
+        if data == "human":
+            username = user_info.get("username", "")
+            profile_send_message(
+                PROFILE_OWNER_ID,
+                f"📩 *សំណើទាក់ទងផ្ទាល់ពី* {first_name}"
+                f"{(' @' + username) if username else ''}\n"
+                f"លេខសម្គាល់: `{chat_id}`",
+                parse_mode="Markdown"
+            )
+            profile_send_message(chat_id, "អរគុណ! ខ្ញុំបានជូនដំណឹងទៅម្ចាស់ហាង ហើយពួកគេនឹងទាក់ទងអ្នកផ្ទាល់ក្នុងពេលឆាប់ៗ។")
+            profile_answer_callback(cb_id)
+            return
+
+        profile_answer_callback(cb_id)
+
+    def profile_handle_command(chat_id, text):
+        if chat_id != PROFILE_OWNER_ID:
+            return
+        parts = text.split()
+        cmd = parts[0].lower()
+        global PROFILE_CURRENT_MODE
+        if cmd == "/mode" and len(parts) > 1:
+            if parts[1] in ("business", "daily"):
+                PROFILE_CURRENT_MODE = parts[1]
+                profile_send_message(chat_id, f"✅ បានប្តូររបៀបទៅ *{PROFILE_CURRENT_MODE}*", parse_mode="Markdown")
+            else:
+                profile_send_message(chat_id, "សូមប្រើ /mode business ឬ /mode daily")
+        elif cmd == "/myid":
+            profile_send_message(chat_id, f"Your chat ID: `{chat_id}`", parse_mode="Markdown")
+
+# -------------------------------------------------------------------
+# Funnel Bot (raw requests)
+# -------------------------------------------------------------------
+FUNNEL_BOT_TOKEN = os.environ.get("FUNNEL_BOT_TOKEN", "")
+FUNNEL_OWNER_ID = int(os.environ.get("FUNNEL_OWNER_ID", 0))
+FUNNEL_GSPREAD_JSON = os.environ.get("FUNNEL_GSPREAD_CREDENTIALS_JSON", "")
+FUNNEL_SHEET_NAME = os.environ.get("FUNNEL_SHEET_NAME", "Bird Nest Leads")
+
+if FUNNEL_BOT_TOKEN:
+    def funnel_send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+        url = f"https://api.telegram.org/bot{FUNNEL_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return requests.post(url, json=payload, timeout=10).json()
+
+    def funnel_answer_callback(callback_id, text=None):
+        url = f"https://api.telegram.org/bot{FUNNEL_BOT_TOKEN}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        requests.post(url, json=payload, timeout=10)
+
+    def funnel_get_sheet():
+        if not FUNNEL_GSPREAD_JSON:
+            return None
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = json.loads(FUNNEL_GSPREAD_JSON)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client.open(FUNNEL_SHEET_NAME).sheet1
+
+    def funnel_append_lead(first_name, product, purpose, budget, location, lead_score, hot, chat_id):
+        try:
+            sheet = funnel_get_sheet()
+            if not sheet:
+                return
+            sheet.append_row([
+                first_name, product, purpose, budget, location,
+                lead_score, "HOT" if hot else "Cold", str(chat_id),
+                datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+            ])
+        except Exception as e:
+            logger.error("Funnel sheet error: %s", e)
+
+    def funnel_get_all_chat_ids():
+        sheet = funnel_get_sheet()
+        if not sheet:
+            return []
+        records = sheet.get_all_values()
+        ids = set()
+        for row in records[1:]:
+            if len(row) > 7 and row[7].isdigit():
+                ids.add(int(row[7]))
+        return list(ids)
+
+    def funnel_product_keyboard():
+        return {"inline_keyboard": [
+            [{"text": "🥤 ទឹកត្រចៀកកាំ (Drink)", "callback_data": "product_drink"}],
+            [{"text": "🥚 ត្រចៀកកាំស្ងួត (Dry Nest)", "callback_data": "product_dry_nest"}],
+            [{"text": "🎁 ឈុតអំណោយ (Gift Set)", "callback_data": "product_gift"}]
+        ]}
+
+    def funnel_purpose_keyboard():
+        return {"inline_keyboard": [
+            [{"text": "ផ្ទាល់ខ្លួន", "callback_data": "purpose_personal"}],
+            [{"text": "សម្រាប់លក់បន្ត", "callback_data": "purpose_resale"}],
+            [{"text": "ជាអំណោយ", "callback_data": "purpose_gift_purpose"}]
+        ]}
+
+    def funnel_budget_keyboard():
+        return {"inline_keyboard": [
+            [{"text": "ក្រោម $50", "callback_data": "budget_low"}],
+            [{"text": "$50 - $200", "callback_data": "budget_medium"}],
+            [{"text": "លើស $200", "callback_data": "budget_high"}]
+        ]}
+
+    def funnel_location_keyboard():
+        return {"inline_keyboard": [
+            [{"text": "ភ្នំពេញ", "callback_data": "location_pp"}],
+            [{"text": "ខេត្ត", "callback_data": "location_provinces"}],
+            [{"text": "ផ្សេងៗ", "callback_data": "location_other"}]
+        ]}
+
+    funnel_user_state = {}
+    FUNNEL_SCORE_MAP = {
+        "product": {"drink": 5, "dry_nest": 10, "gift": 8},
+        "purpose": {"personal": 5, "resale": 20, "gift_purpose": 10},
+        "budget": {"low": 5, "medium": 15, "high": 30},
+        "location": {"pp": 10, "provinces": 5, "other": 5}
+    }
+
+    def funnel_start_funnel(chat_id, first_name):
+        funnel_user_state[chat_id] = {"step": "ask_product", "score": 0, "answers": {}}
+        funnel_send_message(
+            chat_id,
+            f"👋 សួស្ដី {first_name}! អរគុណដែលចាប់អារម្មណ៍ផលិតផលរបស់យើង។\n\n"
+            "ដើម្បីជួយអ្នកបានល្អបំផុត សូមឆ្លើយសំណួរខ្លីៗមួយចំនួន។",
+            reply_markup=funnel_product_keyboard()
+        )
+
+    def funnel_handle_callback(callback):
+        data = callback["data"]
+        cb_id = callback["id"]
+        msg = callback.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        user_info = callback.get("from", {})
+        first_name = user_info.get("first_name", "អ្នក")
+
+        if chat_id not in funnel_user_state:
+            funnel_start_funnel(chat_id, first_name)
+            funnel_answer_callback(cb_id)
+            return
+
+        state = funnel_user_state[chat_id]
+        step = state["step"]
+
+        if step == "ask_product" and data.startswith("product_"):
+            product = data.split("_")[1]
+            state["answers"]["product"] = product
+            state["score"] += FUNNEL_SCORE_MAP["product"].get(product, 0)
+            state["step"] = "ask_purpose"
+            funnel_send_message(chat_id, "តើអ្នកទិញសម្រាប់គោលបំណងអ្វី?", reply_markup=funnel_purpose_keyboard())
+            funnel_answer_callback(cb_id)
+            return
+
+        if step == "ask_purpose" and data.startswith("purpose_"):
+            purpose = data.split("_")[1] if data != "purpose_gift_purpose" else "gift_purpose"
+            state["answers"]["purpose"] = purpose
+            state["score"] += FUNNEL_SCORE_MAP["purpose"].get(purpose, 0)
+            state["step"] = "ask_budget"
+            funnel_send_message(chat_id, "តើថវិការបស់អ្នកប្រហែលប៉ុន្មាន?", reply_markup=funnel_budget_keyboard())
+            funnel_answer_callback(cb_id)
+            return
+
+        if step == "ask_budget" and data.startswith("budget_"):
+            budget = data.split("_")[1]
+            state["answers"]["budget"] = budget
+            state["score"] += FUNNEL_SCORE_MAP["budget"].get(budget, 0)
+            state["step"] = "ask_location"
+            funnel_send_message(chat_id, "តើអ្នកស្ថិតនៅទីតាំងណា?", reply_markup=funnel_location_keyboard())
+            funnel_answer_callback(cb_id)
+            return
+
+        if step == "ask_location" and data.startswith("location_"):
+            location = data.split("_")[1]
+            state["answers"]["location"] = location
+            state["score"] += FUNNEL_SCORE_MAP["location"].get(location, 0)
+
+            lead_score = state["score"]
+            hot = lead_score >= 40
+
+            summary = (
+                f"📊 *អតិថិជនថ្មី (Lead)*\n"
+                f"ឈ្មោះ: {first_name}\n"
+                f"ផលិតផល: {state['answers'].get('product')}\n"
+                f"គោលបំណង: {state['answers'].get('purpose')}\n"
+                f"ថវិកា: {state['answers'].get('budget')}\n"
+                f"ទីតាំង: {state['answers'].get('location')}\n"
+                f"ពិន្ទុ: {lead_score} {'🔥 HOT' if hot else '🧊 Cold'}\n"
+                f"User ID: `{chat_id}`"
+            )
+            funnel_send_message(FUNNEL_OWNER_ID, summary, parse_mode="Markdown")
+
+            funnel_append_lead(
+                first_name,
+                state['answers'].get('product'),
+                state['answers'].get('purpose'),
+                state['answers'].get('budget'),
+                state['answers'].get('location'),
+                lead_score,
+                hot,
+                chat_id
+            )
+
+            if hot:
+                final_text = "🔥 អរគុណ! អ្នកជាអតិថិជនដែលមានសក្តានុពលខ្ពស់។\nម្ចាស់ហាងនឹងទាក់ទងអ្នកឆាប់ៗនេះ។"
+            else:
+                final_text = "អរគុណ! យើងបានកត់ត្រាចំណាប់អារម្មណ៍របស់អ្នក។\nសូមចូលមើលហាងយើងសម្រាប់ព័ត៌មានបន្ថែម។"
+            funnel_send_message(
+                chat_id,
+                final_text,
+                reply_markup={"inline_keyboard": [[{"text": "🛒 បើក Mini App", "url": PROFILE_BIRD_BOT_LINK}]]}
+            )
+            del funnel_user_state[chat_id]
+            funnel_answer_callback(cb_id)
+            return
+
+        funnel_answer_callback(cb_id)
+
+    def funnel_handle_owner_command(chat_id, text):
+        if chat_id != FUNNEL_OWNER_ID:
+            return False
+        parts = text.split(" ", 1)
+        cmd = parts[0].lower()
+        if cmd == "/broadcast" and len(parts) > 1:
+            message_text = parts[1]
+            user_ids = funnel_get_all_chat_ids()
+            if not user_ids:
+                funnel_send_message(chat_id, "No leads found in the sheet.")
+                return True
+            funnel_send_message(chat_id, f"Starting broadcast to {len(user_ids)} users...")
+            success, failed = 0, 0
+            for uid in user_ids:
+                try:
+                    res = funnel_send_message(uid, message_text)
+                    if res.get("ok"):
+                        success += 1
+                    else:
+                        failed += 1
+                except:
+                    failed += 1
+                time.sleep(0.05)
+            funnel_send_message(chat_id, f"Broadcast finished: {success} sent, {failed} failed.")
+            return True
+        if cmd == "/list":
+            user_ids = funnel_get_all_chat_ids()
+            funnel_send_message(chat_id, f"Total leads: {len(user_ids)}")
+            return True
+        if cmd in ("/help", "/start"):
+            funnel_send_message(chat_id,
+                "Commands:\n"
+                "/broadcast <message> – send promo to all leads\n"
+                "/list – show lead count\n"
+                "/help – this message"
+            )
+            return True
+        return False
+
+# -------------------------------------------------------------------
+# Flask App (all routes)
+# -------------------------------------------------------------------
+flask_app = Flask(__name__)
+
+@flask_app.post("/webhook/autosum")
+def autosum_webhook():
+    if request.content_length and request.content_length > MAX_WEBHOOK_BODY:
+        return "Payload too large", 413
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return "Bad Request", 400
+    update = Update.de_json(payload, application.bot)
+    LOOP.run_until_complete(application.process_update(update))
+    return "OK"
+
+@flask_app.post("/webhook/profile")
+def profile_webhook():
+    if not PROFILE_BOT_TOKEN:
+        return "Profile bot not configured", 503
+    data = request.get_json()
+    if "callback_query" in data:
+        profile_handle_callback(data["callback_query"])
+        return "ok", 200
+    msg = data.get("message", {})
+    if msg:
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "").strip()
+        if text.startswith("/"):
+            profile_handle_command(chat_id, text)
+        else:
+            user = msg.get("from", {})
+            profile_process_message(chat_id, text,
+                                    user.get("first_name", "អ្នក"),
+                                    user.get("username"))
+        return "ok", 200
+    bmsg = data.get("business_message", {})
+    if bmsg:
+        chat_id = bmsg.get("chat", {}).get("id")
+        text = bmsg.get("text", "").strip()
+        if not text.startswith("/"):
+            user = bmsg.get("from", {})
+            profile_process_message(chat_id, text,
+                                    user.get("first_name", "អ្នក"),
+                                    user.get("username"))
+        return "ok", 200
+    return "ok", 200
+
+@flask_app.post("/webhook/funnel")
+def funnel_webhook():
+    if not FUNNEL_BOT_TOKEN:
+        return "Funnel bot not configured", 503
+    data = request.get_json()
+    if "callback_query" in data:
+        funnel_handle_callback(data["callback_query"])
+        return "ok", 200
+    msg = data.get("message", {})
+    if msg:
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "").strip()
+        if funnel_handle_owner_command(chat_id, text):
+            return "ok", 200
+        user = msg.get("from", {})
+        first_name = user.get("first_name", "អ្នក")
+        funnel_start_funnel(chat_id, first_name)
+        return "ok", 200
+    return "ok", 200
+
+@flask_app.get("/")
+def health():
+    return "Bot is running ✅"
+
+@flask_app.get("/set_webhook")
+def set_webhook():
+    base_url = os.environ.get("WEBHOOK_URL", request.host_url.rstrip("/"))
+    url = f"{base_url}/webhook/autosum"
+    result = LOOP.run_until_complete(application.bot.set_webhook(url))
+    return f"AutoSum webhook set to {url} — Telegram replied: {result}"
+
+@flask_app.route("/email_webhook", methods=["POST"])
+def email_webhook():
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if EMAIL_WEBHOOK_SECRET and not hmac.compare_digest(secret, EMAIL_WEBHOOK_SECRET):
+        return "Unauthorized", 403
+    if request.content_length and request.content_length > MAX_WEBHOOK_BODY:
+        return "Payload too large", 413
+    payload = request.get_json(force=True, silent=True)
+    if not payload:
+        return "Bad Request", 400
+    usd = float(payload.get("usd", 0))
+    khr = float(payload.get("khr", 0))
+    note = str(payload.get("note", ""))[:MAX_NOTE_LEN]
+    if usd == 0 and khr == 0:
+        return "No amount", 400
+    entry = {
+        "date": datetime.date.today().strftime("%Y-%m-%d"),
+        "usd": usd,
+        "khr": khr,
+        "note": note,
+        "category": "other",
+        "business": PAYWAY_BUSINESS,
+        "tran_id": str(uuid.uuid4()),
+        "payway_trx_id": ""
+    }
+    add_transaction(entry)
+    write_master_sheet_row(entry)
+    append_to_sheet(entry)
+    return "OK", 200
+
+# -------------------------------------------------------------------
+# Build Application (AutoSum)
+# -------------------------------------------------------------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+application = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .updater(None)
+    .build()
+)
+
+# Register all AutoSum handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("ping", ping))
+application.add_handler(CommandHandler("settings", settings))
+application.add_handler(CommandHandler("recent", recent_entries))
+application.add_handler(CommandHandler("delete_index", delete_index))
+application.add_handler(CommandHandler("delete", delete_index))
+application.add_handler(CommandHandler("edit_index", edit_index))
+application.add_handler(CommandHandler("undo_delete", undo_delete))
+application.add_handler(CommandHandler("compare", compare))
+application.add_handler(CommandHandler("chart", chart))
+application.add_handler(CommandHandler("summary", summary))
+application.add_handler(CommandHandler("bysender", bysender))
+application.add_handler(CommandHandler("duplicates", duplicates))
+application.add_handler(CommandHandler("announce", announce))
+application.add_handler(CommandHandler("clear_all", clear_all_command))
+application.add_handler(CommandHandler("confirm_clear", confirm_clear_command))
+application.add_handler(CommandHandler("add_manager", add_manager))
+application.add_handler(CommandHandler("remove_manager", remove_manager))
+application.add_handler(CommandHandler("permissions", permissions))
+application.add_handler(CommandHandler("sync", manual_sync))
+application.add_handler(CommandHandler("sync_status", sync_status))
+application.add_handler(CommandHandler("day", day_report))
+application.add_handler(CommandHandler("range", range_report))
+application.add_handler(CommandHandler("top", top))
+application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("search", search))
+application.add_handler(CommandHandler("lock", lock))
+application.add_handler(CommandHandler("unlock", unlock))
+application.add_handler(CommandHandler("remind", set_reminder))
+application.add_handler(CommandHandler("export", export_csv))
+application.add_handler(CommandHandler("bybusiness", bybusiness_command))
+application.add_handler(CommandHandler("force_sync", force_sync))
+application.add_handler(CommandHandler("sheet_test", sheet_test))
+application.add_handler(CommandHandler("check_rebuild", check_rebuild))
+application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
+
+application.add_handler(MessageHandler(
+    filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+    group_message_handler
+))
+application.add_handler(CommandHandler("daily", group_daily_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("weekly", group_weekly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("monthly", group_monthly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("quarterly", group_quarterly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("yearly", group_yearly_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("range", group_range_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("top", group_top_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("duplicates", group_duplicates_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("edit_index", group_edit_index_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("summary", group_summary_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("bysender", group_bysender_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("compare", group_compare_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CommandHandler("menu", group_menu_command, filters=filters.ChatType.GROUPS))
+application.add_handler(CallbackQueryHandler(group_menu_callback, pattern="^grpmenu_"))
+
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+LOOP = asyncio.new_event_loop()
+LOOP.run_until_complete(application.initialize())
+
+# -------------------------------------------------------------------
+# Background workers (AutoSum)
 # -------------------------------------------------------------------
 def sync_worker(bot_token: str) -> None:
     while True:
@@ -2087,7 +2654,6 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
     return False
 
 def sheet_worker() -> None:
-    """Continuously process queued sheet rows, auto‑restarting on failure."""
     while True:
         try:
             _process_sheet_queue()
@@ -2096,23 +2662,20 @@ def sheet_worker() -> None:
             time.sleep(5)
 
 def _process_sheet_queue() -> None:
-    """Get items from sheet_queue and write them to both sheets."""
     while True:
         try:
             item = sheet_queue.get(timeout=5)
         except queue.Empty:
             continue
-        if item is None:          # sentinel to stop the worker
+        if item is None:
             sheet_queue.task_done()
             break
         entry, row = item
         try:
-            # Write to master sheet
             sheet = get_sheet()
             if sheet:
                 _write_row_with_retry(sheet, row)
                 logger.info("Sheet export (background): %s", entry.get('note','')[:30])
-            # Write to All Businesses sheet
             biz_sheet = get_all_businesses_sheet()
             if biz_sheet:
                 _write_row_with_retry(biz_sheet, row)
@@ -2128,134 +2691,6 @@ def _flush_sheet_queue() -> None:
 
 import atexit
 atexit.register(_flush_sheet_queue)
-
-# -------------------------------------------------------------------
-# Build Application
-# -------------------------------------------------------------------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-application = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .updater(None)
-    .build()
-)
-
-# Register all handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("ping", ping))
-application.add_handler(CommandHandler("settings", settings))
-application.add_handler(CommandHandler("recent", recent_entries))
-application.add_handler(CommandHandler("delete_index", delete_index))
-application.add_handler(CommandHandler("delete", delete_index))
-application.add_handler(CommandHandler("edit_index", edit_index))
-application.add_handler(CommandHandler("undo_delete", undo_delete))
-application.add_handler(CommandHandler("compare", compare))
-application.add_handler(CommandHandler("chart", chart))
-application.add_handler(CommandHandler("summary", summary))
-application.add_handler(CommandHandler("bysender", bysender))
-application.add_handler(CommandHandler("duplicates", duplicates))
-application.add_handler(CommandHandler("announce", announce))
-application.add_handler(CommandHandler("clear_all", clear_all_command))
-application.add_handler(CommandHandler("confirm_clear", confirm_clear_command))
-application.add_handler(CommandHandler("add_manager", add_manager))
-application.add_handler(CommandHandler("remove_manager", remove_manager))
-application.add_handler(CommandHandler("permissions", permissions))
-application.add_handler(CommandHandler("sync", manual_sync))
-application.add_handler(CommandHandler("sync_status", sync_status))
-application.add_handler(CommandHandler("day", day_report))
-application.add_handler(CommandHandler("range", range_report))
-application.add_handler(CommandHandler("top", top))
-application.add_handler(CommandHandler("stats", stats))
-application.add_handler(CommandHandler("search", search))
-application.add_handler(CommandHandler("force_sync", force_sync))
-application.add_handler(CommandHandler("lock", lock))
-application.add_handler(CommandHandler("unlock", unlock))
-application.add_handler(CommandHandler("remind", set_reminder))
-application.add_handler(CommandHandler("export", export_csv))
-application.add_handler(CommandHandler("bybusiness", bybusiness_command))
-application.add_handler(CommandHandler("sheet_test", sheet_test))
-application.add_handler(CommandHandler("check_rebuild", check_rebuild))
-application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
-
-application.add_handler(MessageHandler(
-    filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-    group_message_handler
-))
-application.add_handler(CommandHandler("daily", group_daily_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("weekly", group_weekly_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("monthly", group_monthly_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("quarterly", group_quarterly_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("yearly", group_yearly_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("range", group_range_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("top", group_top_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("duplicates", group_duplicates_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("edit_index", group_edit_index_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("summary", group_summary_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("bysender", group_bysender_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("compare", group_compare_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CommandHandler("menu", group_menu_command, filters=filters.ChatType.GROUPS))
-application.add_handler(CallbackQueryHandler(group_menu_callback, pattern="^grpmenu_"))
-
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-LOOP = asyncio.new_event_loop()
-LOOP.run_until_complete(application.initialize())
-
-# -------------------------------------------------------------------
-# Flask
-# -------------------------------------------------------------------
-flask_app = Flask(__name__)
-
-@flask_app.post("/webhook")
-def webhook():
-    if request.content_length and request.content_length > MAX_WEBHOOK_BODY:
-        return "Payload too large", 413
-    payload = request.get_json(force=True, silent=True)
-    if payload is None:
-        return "Bad Request", 400
-    update = Update.de_json(payload, application.bot)
-    LOOP.run_until_complete(application.process_update(update))
-    return "OK"
-
-@flask_app.get("/")
-def health():
-    return "Bot is running ✅"
-
-@flask_app.get("/set_webhook")
-def set_webhook():
-    base_url = os.environ.get("WEBHOOK_URL", request.host_url.rstrip("/"))
-    url = f"{base_url}/webhook"
-    result = LOOP.run_until_complete(application.bot.set_webhook(url))
-    return f"Webhook set to {url} — Telegram replied: {result}"
-
-@flask_app.route("/email_webhook", methods=["POST"])
-def email_webhook():
-    secret = request.headers.get("X-Webhook-Secret", "")
-    if EMAIL_WEBHOOK_SECRET and not hmac.compare_digest(secret, EMAIL_WEBHOOK_SECRET):
-        return "Unauthorized", 403
-    if request.content_length and request.content_length > MAX_WEBHOOK_BODY:
-        return "Payload too large", 413
-    payload = request.get_json(force=True, silent=True)
-    if not payload:
-        return "Bad Request", 400
-    usd = float(payload.get("usd", 0))
-    khr = float(payload.get("khr", 0))
-    note = str(payload.get("note", ""))[:MAX_NOTE_LEN]
-    if usd == 0 and khr == 0:
-        return "No amount", 400
-    entry = {
-        "date": datetime.date.today().strftime("%Y-%m-%d"),
-        "usd": usd,
-        "khr": khr,
-        "note": note,
-        "category": "other",
-        "business": PAYWAY_BUSINESS,
-        "tran_id": str(uuid.uuid4())
-    }
-    add_transaction(entry)
-    append_to_sheet(entry)
-    return "OK", 200
 
 # -------------------------------------------------------------------
 # Startup
