@@ -220,22 +220,38 @@ def load_data() -> List[Dict[str, Any]]:
     return data
 
 def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
-             entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
-             entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
+    # Retry up to 5 times if the database is locked (another write in progress)
+    max_retries = 5
+    for attempt in range(max_retries):
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        # Set a busy timeout so SQLite waits a few seconds before giving up
+        conn.execute("PRAGMA busy_timeout = 3000")   # 3 seconds
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+                 entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
+            )
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.2 * (attempt + 1))   # small increasing delay
+                continue
+            logger.error("DB operational error (attempt %d): %s", attempt + 1, e)
+            return False
+        except sqlite3.IntegrityError:
+            # Duplicate PayWay transaction – silently ignore
+            return False
+        except Exception as e:
+            logger.error("DB insert error: %s", e)
+            return False
+        finally:
+            conn.close()
+    return False
 
 def delete_transaction(tran_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
