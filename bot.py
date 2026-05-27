@@ -975,6 +975,38 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{e['date']} | ${e['usd']:.2f} / ៛{e['khr']:,} | {e.get('note','')[:30]}")
     await update.message.reply_text("\n".join(lines))
 
+async def force_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    data = load_data()
+    if not data:
+        await update.message.reply_text("គ្មានទិន្នន័យដើម្បីធ្វើសមកាលកម្មទេ។")
+        return
+    sheet = get_sheet()
+    if not sheet:
+        await update.message.reply_text("Sheet មិនអាចចូលប្រើបានទេ។")
+        return
+    count = 0
+    for entry in data:
+        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            entry.get("date", ""),
+            entry.get("usd", 0),
+            entry.get("khr", 0),
+            CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ"),
+            entry.get("note", ""),
+            entry.get("business", ""),
+            now,
+            entry.get("tran_id", ""),
+            entry.get("payway_trx_id", "")
+        ]
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+            count += 1
+        except Exception as e:
+            logger.error("Force sync row error: %s", e)
+    await update.message.reply_text(f"✅ បានធ្វើសមកាលកម្ម {count} ធាតុទៅ Google Sheets។")
+
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         return
@@ -1996,6 +2028,7 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
     return False
 
 def sheet_worker() -> None:
+    """Continuously process queued sheet rows, auto‑restarting on failure."""
     while True:
         try:
             _process_sheet_queue()
@@ -2004,20 +2037,23 @@ def sheet_worker() -> None:
             time.sleep(5)
 
 def _process_sheet_queue() -> None:
+    """Get items from sheet_queue and write them to both sheets."""
     while True:
         try:
             item = sheet_queue.get(timeout=5)
         except queue.Empty:
             continue
-        if item is None:
+        if item is None:          # sentinel to stop the worker
             sheet_queue.task_done()
             break
         entry, row = item
         try:
+            # Write to master sheet
             sheet = get_sheet()
             if sheet:
                 _write_row_with_retry(sheet, row)
                 logger.info("Sheet export (background): %s", entry.get('note','')[:30])
+            # Write to All Businesses sheet
             biz_sheet = get_all_businesses_sheet()
             if biz_sheet:
                 _write_row_with_retry(biz_sheet, row)
@@ -2073,6 +2109,7 @@ application.add_handler(CommandHandler("range", range_report))
 application.add_handler(CommandHandler("top", top))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("search", search))
+application.add_handler(CommandHandler("force_sync", force_sync))
 application.add_handler(CommandHandler("lock", lock))
 application.add_handler(CommandHandler("unlock", unlock))
 application.add_handler(CommandHandler("remind", set_reminder))
