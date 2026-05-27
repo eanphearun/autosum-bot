@@ -163,18 +163,19 @@ def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id TEXT PRIMARY KEY,
-            date TEXT NOT NULL,
-            usd REAL NOT NULL,
-            khr INTEGER NOT NULL,
-            category TEXT,
-            note TEXT,
-            business TEXT,
-            source TEXT,
-            timestamp TEXT
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS transactions (
+        id TEXT PRIMARY KEY,
+        date TEXT NOT NULL,
+        usd REAL NOT NULL,
+        khr INTEGER NOT NULL,
+        category TEXT,
+        note TEXT,
+        business TEXT,
+        source TEXT,
+        timestamp TEXT,
+        payway_trx_id TEXT UNIQUE
+    )
+""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON transactions(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_business ON transactions(business)")
     conn.close()
@@ -219,17 +220,24 @@ def load_data() -> List[Dict[str, Any]]:
     conn.close()
     return data
 
-def add_transaction(entry: Dict[str, Any]) -> None:
+def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
-         entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
-         entry.get("source", ""), datetime.datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute(
+            "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+             entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+             entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Duplicate PayWay transaction – silently ignore
+        return False
+    finally:
+        conn.close()
 
 def delete_transaction(tran_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -326,7 +334,8 @@ def append_to_sheet(entry: dict) -> None:
             _sanitise_sheet_value(entry.get("note", "")),
             _sanitise_sheet_value(entry.get("business", "")),
             now,
-            entry["tran_id"]
+            entry["tran_id"],
+            entry.get("payway_trx_id", "")
         ]
         sheet_queue.put((entry, row))
     except Exception as e:
@@ -407,9 +416,13 @@ def rebuild_from_sheet() -> None:
             note_val = row[4] if len(row) > 4 else ""
             business_val = row[5] if len(row) > 5 else "manual"
             tran_id_val = row[7] if len(row) > 7 else str(uuid.uuid4())
+            payway_trx_val = row[8] if len(row) > 8 else ""   # new column I
             cur.execute(
-                "INSERT INTO transactions (id, date, usd, khr, category, note, business, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (tran_id_val, date_val, usd_val, khr_val, category_val.lower(), note_val[:MAX_NOTE_LEN], business_val, datetime.datetime.now().isoformat())
+                "INSERT INTO transactions (id, date, usd, khr, category, note, business, timestamp, payway_trx_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tran_id_val, date_val, usd_val, khr_val, category_val.lower(),
+                note_val[:MAX_NOTE_LEN], business_val,
+                datetime.datetime.now().isoformat(), payway_trx_val or None)
             )
             imported_ids.add(tran_id_val)
         conn.commit()
@@ -423,13 +436,14 @@ def rebuild_from_sheet() -> None:
         logger.error("Rebuild failed: %s", e)
 
 def seed_seen_trx_ids() -> None:
-    data = load_data()
+    """Load all previously seen PayWay Trx. IDs from the SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT payway_trx_id FROM transactions WHERE payway_trx_id IS NOT NULL")
     with _seen_trx_lock:
-        for entry in data:
-            note = entry.get("note", "")
-            m = re.search(r"Trx:\s*(\d+)", note) or re.search(r"Trx\.\s*ID:\s*(\d+)", note)
-            if m:
-                SEEN_TRX_IDS.add(m.group(1))
+        for row in cur.fetchall():
+            SEEN_TRX_IDS.add(row[0])
+    conn.close()
 
 # -------------------------------------------------------------------
 # Core helper functions
@@ -665,11 +679,11 @@ def extract_group_payment(text: str) -> Optional[Tuple[float, float, str]]:
 # Group message handler (with semaphore and add_transaction)
 # -------------------------------------------------------------------
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # 🔍 DIAGNOSTIC LOG – shows raw message and chat ID
     if update.message and update.message.text:
         logger.info("📨 GROUP MSG: chat_id=%s, text=%s", update.message.chat.id, update.message.text[:200])
     else:
         logger.info("📨 GROUP MSG: no text")
+
     async with _group_semaphore:
         if not update.message or not update.message.text:
             return
@@ -680,18 +694,25 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if _is_rate_limited(msg.from_user.id):
             return
+
         result = extract_group_payment(msg.text)
         if not result:
             return
         usd, khr, note = result
+
+        # Extract PayWay transaction ID (if present) from the note
         trx_id_match = re.search(r"Trx:\s*(\d+)", note)
-        if trx_id_match:
-            trx_id = trx_id_match.group(1)
+        payway_id = trx_id_match.group(1) if trx_id_match else None
+
+        # Quick in‑memory duplicate check (optional but fast)
+        if payway_id:
             with _seen_trx_lock:
-                if trx_id in SEEN_TRX_IDS:
-                    logger.info("Duplicate Trx. ID %s ignored.", trx_id)
+                if payway_id in SEEN_TRX_IDS:
+                    logger.info("Duplicate Trx. ID %s ignored (memory).", payway_id)
                     return
-                SEEN_TRX_IDS.add(trx_id)
+                # We'll add it only after successful DB insert
+
+        # Build the entry
         today = datetime.date.today()
         business_tag = group_business_map.get(msg.chat.id, GROUP_BUSINESS_TAG)
         entry = {
@@ -702,9 +723,20 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "category": "other",
             "business": business_tag,
             "source": f"group_{msg.chat.id}_msg{msg.message_id}",
-            "tran_id": str(uuid.uuid4())
+            "tran_id": str(uuid.uuid4()),
+            "payway_trx_id": payway_id or ""
         }
-        add_transaction(entry)          # ✅ fast insert
+
+        # Try to insert – add_transaction returns False if duplicate
+        if not add_transaction(entry, payway_id):
+            logger.info("Duplicate Trx. ID %s ignored (DB).", payway_id)
+            return
+
+        # Success – now safe to add to memory and queue sheet write
+        if payway_id:
+            with _seen_trx_lock:
+                SEEN_TRX_IDS.add(payway_id)
+
         append_to_sheet(entry)
         logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
                     usd, khr, msg.chat.id, business_tag)
@@ -1046,6 +1078,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     today = datetime.date.today()
     data = load_data()
 
+    # Report buttons (bypass lock)
     if text == "ប្រចាំថ្ងៃ":
         date_str = today.strftime("%Y-%m-%d")
         entries = [e for e in data if e["date"] == date_str]
@@ -1072,19 +1105,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("ជ្រើសរើសប្រភេទសម្រាប់ធាតុចុងក្រោយ៖", reply_markup=keyboard)
         return
 
+    # ----- Manual entry (with lock & duplicate prevention) -----
     usd, khr, note = extract_amounts(text)
     if usd or khr:
-        trx_id_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text)
-        if trx_id_match:
-            trx_id = trx_id_match.group(1)
+        # Extract PayWay transaction ID from raw message
+        trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text)
+        payway_id = trx_match.group(1) if trx_match else None
+
+        # Quick in‑memory duplicate check (optional but fast)
+        if payway_id:
             with _seen_trx_lock:
-                if trx_id in SEEN_TRX_IDS:
+                if payway_id in SEEN_TRX_IDS:
                     await update.message.reply_text("⏭ ប្រតិបត្តិការនេះបានកត់ត្រារួចហើយ (Trx. ID ដូចគ្នា)។")
                     return
-                SEEN_TRX_IDS.add(trx_id)
+                # We'll add it to SEEN_TRX_IDS only after successful DB insert below
         if MANUAL_LOCKED:
             await update.message.reply_text("⛔ ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។ សូមទាក់ទងម្ចាស់។")
             return
+
         entry = {
             "date": today.strftime("%Y-%m-%d"),
             "usd": usd,
@@ -1092,9 +1130,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "note": note[:MAX_NOTE_LEN],
             "category": "other",
             "business": "manual",
-            "tran_id": str(uuid.uuid4())
+            "tran_id": str(uuid.uuid4()),
+            "payway_trx_id": payway_id or ""
         }
-        add_transaction(entry)          # ✅ fast insert
+        # add_transaction returns False if duplicate (DB constraint)
+        if not add_transaction(entry, payway_id):
+            await update.message.reply_text("⏭ ប្រតិបត្តិការនេះមានរួចហើយ (Trx. ID ដូចគ្នា)។")
+            return
+
+        # Now it's safe to add to in‑memory set
+        if payway_id:
+            with _seen_trx_lock:
+                SEEN_TRX_IDS.add(payway_id)
+
         append_to_sheet(entry)
         parts = []
         if usd:
@@ -1934,6 +1982,14 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
 def sheet_worker() -> None:
     while True:
         try:
+            _process_sheet_queue()
+        except Exception as e:
+            logger.error("Sheet worker crashed, restarting in 5s: %s", e)
+            time.sleep(5)
+
+def _process_sheet_queue() -> None:
+    while True:
+        try:
             item = sheet_queue.get(timeout=5)
         except queue.Empty:
             continue
@@ -1945,14 +2001,12 @@ def sheet_worker() -> None:
             sheet = get_sheet()
             if sheet:
                 _write_row_with_retry(sheet, row)
-            try:
-                biz_sheet = get_all_businesses_sheet()
-                if biz_sheet:
-                    _write_row_with_retry(biz_sheet, row)
-            except Exception as e:
-                logger.error("All Businesses sheet write failed: %s", e)
+                logger.info("Sheet export (background): %s", entry.get('note','')[:30])
+            biz_sheet = get_all_businesses_sheet()
+            if biz_sheet:
+                _write_row_with_retry(biz_sheet, row)
         except Exception as e:
-            logger.error("Sheet worker error: %s", e)
+            logger.error("Sheet worker item error: %s", e)
         finally:
             sheet_queue.task_done()
 
