@@ -341,6 +341,37 @@ def append_to_sheet(entry: dict) -> None:
     except Exception as e:
         logger.error("Failed to queue sheet row: %s", e)
 
+def write_master_sheet_row(entry: dict) -> bool:
+    """Write a single row to the master sheet synchronously, with retries.
+    Returns True if successful, False otherwise."""
+    sheet = get_sheet()
+    if not sheet:
+        return False
+    now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+    if "tran_id" not in entry:
+        entry["tran_id"] = str(uuid.uuid4())
+    row = [
+        _sanitise_sheet_value(entry.get("date", "")),
+        entry.get("usd", 0),
+        entry.get("khr", 0),
+        _sanitise_sheet_value(CATEGORIES.get(entry.get("category", "other"), "💸 ផ្សេងៗ")),
+        _sanitise_sheet_value(entry.get("note", "")),
+        _sanitise_sheet_value(entry.get("business", "")),
+        now,
+        entry["tran_id"],
+        entry.get("payway_trx_id", "")
+    ]
+    # Try up to 3 times with a short delay
+    for attempt in range(3):
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+            logger.info("Sheet write (sync): %s", entry.get('note','')[:30])
+            return True
+        except Exception as e:
+            logger.warning("Sheet write attempt %d failed: %s", attempt+1, e)
+            time.sleep(2)
+    return False
+
 def get_all_businesses_sheet():
     if not GSPREAD_CREDENTIALS_JSON:
         return None
@@ -737,6 +768,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
 
+        write_master_sheet_row(entry)
         append_to_sheet(entry)
         logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
                     usd, khr, msg.chat.id, business_tag)
@@ -1216,6 +1248,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
 
+        write_master_sheet_row(entry)
         append_to_sheet(entry)
         parts = []
         if usd:
@@ -1325,7 +1358,8 @@ def sync_payway_transactions() -> int:
             continue
         add_transaction(entry)          # ✅ fast insert
         imported_ids.add(entry["tran_id"])
-        added += 1
+        added += 1 
+        write_master_sheet_row(entry)
         append_to_sheet(entry)
     if added > 0:
         state["imported_ids"] = list(imported_ids)
