@@ -1020,6 +1020,22 @@ async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     MANUAL_LOCKED = False
     await update.message.reply_text("🔓 ការកត់ត្រាដោយដៃត្រូវបានដោះសោ។")
 
+async def sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            await update.message.reply_text("❌ Master sheet not found. Check SHEET_NAME and sharing.")
+            return
+        # Write a test row directly (bypass queue)
+        now = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime("%Y-%m-%d %H:%M:%S")
+        row = ["TEST", 0, 0, "💸 ផ្សេងៗ", "Sheet health check", "manual", now, str(uuid.uuid4()), ""]
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        await update.message.reply_text("✅ Master sheet is accessible and test row written.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Sheet error: {e}")
+
 # ---------- Manager management ----------
 async def add_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -2062,6 +2078,7 @@ application.add_handler(CommandHandler("unlock", unlock))
 application.add_handler(CommandHandler("remind", set_reminder))
 application.add_handler(CommandHandler("export", export_csv))
 application.add_handler(CommandHandler("bybusiness", bybusiness_command))
+application.add_handler(CommandHandler("sheet_test", sheet_test))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
 
 application.add_handler(MessageHandler(
