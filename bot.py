@@ -1068,6 +1068,31 @@ async def sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         await update.message.reply_text(f"❌ Sheet error: {e}")
 
+async def check_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        return
+    sheet = get_sheet()
+    if not sheet:
+        await update.message.reply_text("❌ Master sheet not found.")
+        return
+    try:
+        rows = sheet.get_all_values()
+        await update.message.reply_text(f"📊 Sheet has {len(rows)} rows (including header).")
+        if len(rows) > 1:
+            # Show first and last data rows (truncated)
+            first = rows[1] if len(rows) > 1 else ["-"]
+            last = rows[-1] if len(rows) > 1 else ["-"]
+            await update.message.reply_text(
+                f"First data row (truncated): {first[0]}, {first[1]}, {first[2]}, {first[3]}, {first[4][:30]}, {first[5]}, {first[7]}, {first[8] if len(first)>8 else 'N/A'}\n"
+                f"Last data row (truncated): {last[0]}, {last[1]}, {last[2]}, {last[3]}, {last[4][:30]}, {last[5]}, {last[7]}, {last[8] if len(last)>8 else 'N/A'}"
+            )
+        # Trigger the rebuild manually
+        rebuild_from_sheet()
+        data = load_data()
+        await update.message.reply_text(f"🔄 Rebuild complete. Current database has {len(data)} entries.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 # ---------- Manager management ----------
 async def add_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -2116,6 +2141,7 @@ application.add_handler(CommandHandler("remind", set_reminder))
 application.add_handler(CommandHandler("export", export_csv))
 application.add_handler(CommandHandler("bybusiness", bybusiness_command))
 application.add_handler(CommandHandler("sheet_test", sheet_test))
+application.add_handler(CommandHandler("check_rebuild", check_rebuild))
 application.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
 
 application.add_handler(MessageHandler(
