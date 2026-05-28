@@ -719,7 +719,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
 
-        write_master_sheet_row(entry)
         append_to_sheet(entry)
         logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
                     usd, khr, msg.chat.id, business_tag)
@@ -1112,7 +1111,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if payway_id:
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
-        write_master_sheet_row(entry)
         append_to_sheet(entry)
         parts = []
         if usd:
@@ -1226,7 +1224,6 @@ def sync_payway_transactions() -> int:
         add_transaction(entry, entry.get("payway_trx_id"))
         imported_ids.add(entry["tran_id"])
         added += 1
-        write_master_sheet_row(entry)
         append_to_sheet(entry)
     if added > 0:
         state["imported_ids"] = list(imported_ids)
@@ -2471,7 +2468,6 @@ def email_webhook():
         "payway_trx_id": ""
     }
     add_transaction(entry)
-    write_master_sheet_row(entry)
     append_to_sheet(entry)
     return "OK", 200
 
