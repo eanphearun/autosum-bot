@@ -220,17 +220,9 @@ def load_data() -> List[Dict[str, Any]]:
     conn.close()
     return data
 
-def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
-    """Enqueue a DB insert and wait (up to 15 s) for the result."""
-    result_event = threading.Event()
-    result_holder = {"success": False}
-    db_queue.put((entry, payway_id, result_event, result_holder))
-    # Wait for the worker to finish this specific item
-    if result_event.wait(timeout=15):
-        return result_holder["success"]
-    else:
-        logger.error("DB insert timed out for Trx. ID %s", payway_id)
-        return False
+def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> None:
+    """Queue the insert for the background DB worker – returns immediately."""
+    db_queue.put((entry, payway_id))
 
 def delete_transaction(tran_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -719,16 +711,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "tran_id": str(uuid.uuid4()),
             "payway_trx_id": payway_id or ""
         }
-        success = add_transaction(entry, payway_id)
-        if not success:
-            if payway_id and payway_id in SEEN_TRX_IDS:
-                logger.info("Duplicate Trx. ID %s ignored.", payway_id)
-            else:
-                logger.warning("DB insert failed for Trx. ID %s – will retry via webhook.", payway_id)
-            return
+                # Enqueue the insert (non‑blocking, duplicate already checked in memory)
+        add_transaction(entry, payway_id)
+
+        # Record the PayWay ID in memory so future duplicates are caught instantly
         if payway_id:
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
+
         write_master_sheet_row(entry)
         append_to_sheet(entry)
         logger.info("Group payment recorded: $%.2f / %d ៛ from group %d (business: %s)",
@@ -2655,50 +2645,46 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
 # ---------- Background DB writer (serialises SQLite inserts) ----------
 import threading
 
-def _add_transaction_sync(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
-    """Perform a single insert with retries – called ONLY by the db_worker thread."""
-    max_retries = 5
-    for attempt in range(max_retries):
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        conn.execute("PRAGMA busy_timeout = 10000")   # 10 s
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
-                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
-                 entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False              # real duplicate
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.3 * (attempt + 1))
-                continue
-            logger.error("DB operational error (attempt %d): %s", attempt + 1, e)
-            return False
-        except Exception as e:
-            logger.error("DB insert error: %s", e)
-            return False
-        finally:
-            conn.close()
-    return False
+def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> None:
+    """Queue the insert for the background DB worker – returns immediately."""
+    db_queue.put((entry, payway_id))
 
 def db_worker() -> None:
     """Process database writes one‑by‑one – never gets a lock conflict."""
     while True:
         try:
             item = db_queue.get()
-            if item is None:          # sentinel to stop the worker
+            if item is None:           # sentinel to stop the worker
                 db_queue.task_done()
                 break
-            entry, payway_id, result_event, result_holder = item
-            success = _add_transaction_sync(entry, payway_id)
-            result_holder["success"] = success
-            result_event.set()        # signal that the write finished
+            entry, payway_id = item
+            max_retries = 5
+            for attempt in range(max_retries):
+                conn = sqlite3.connect(DB_FILE, timeout=10.0, check_same_thread=False)
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+                         entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+                         entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
+                    )
+                    conn.commit()
+                    break              # success
+                except sqlite3.IntegrityError:
+                    break              # real duplicate – silently ignore
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        time.sleep(0.3 * (attempt + 1))
+                        continue
+                    logger.error("DB operational error (attempt %d): %s", attempt + 1, e)
+                    break
+                except Exception as e:
+                    logger.error("DB insert error: %s", e)
+                    break
+                finally:
+                    conn.close()
         except Exception as e:
             logger.error("DB worker error: %s", e)
         finally:
