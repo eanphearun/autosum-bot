@@ -1737,6 +1737,14 @@ async def duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if e1["date"] == e2["date"] and e1["usd"] == e2["usd"] and e1["khr"] == e2["khr"]:
                 n1 = (e1.get("note", "") or "").strip()
                 n2 = (e2.get("note", "") or "").strip()
+                # Extract Trx. ID from each note (if present)
+                trx1 = re.search(r"Trx:\s*(\d+)", n1)
+                trx2 = re.search(r"Trx:\s*(\d+)", n2)
+                # If both notes contain a Trx. ID, only flag as duplicate if they are the SAME ID
+                if trx1 and trx2:
+                    if trx1.group(1) != trx2.group(1):
+                        continue   # different transactions, skip
+                # Otherwise, use the old logic (first word match)
                 if n1.split()[0].lower() == n2.split()[0].lower() if n1 and n2 else (not n1 and not n2):
                     dups.append((total - i, total - j, e1, e2))
     if not dups:
@@ -2687,6 +2695,7 @@ def _process_sheet_queue() -> None:
             sheet_queue.task_done()
             break
         entry, row = item
+        logger.info("📤 Sheet worker processing: %s", entry.get('note','')[:30])   # <-- NEW
         try:
             sheet = get_sheet()
             if sheet:
