@@ -57,6 +57,7 @@ clear_confirmation_token_time: Optional[float] = None
 CLEAR_TOKEN_TTL = 120
 MANUAL_LOCKED = False
 sheet_queue = queue.Queue()
+db_queue = queue.Queue()
 SEEN_TRX_IDS: Set[str] = set()
 _seen_trx_lock = threading.Lock()
 
@@ -220,38 +221,16 @@ def load_data() -> List[Dict[str, Any]]:
     return data
 
 def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
-    # Retry up to 5 times if the database is locked (another write in progress)
-    max_retries = 5
-    for attempt in range(max_retries):
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        # Set a busy timeout so SQLite waits a few seconds before giving up
-        conn.execute("PRAGMA busy_timeout = 3000")   # 3 seconds
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
-                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
-                 entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
-            )
-            conn.commit()
-            return True
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.2 * (attempt + 1))   # small increasing delay
-                continue
-            logger.error("DB operational error (attempt %d): %s", attempt + 1, e)
-            return False
-        except sqlite3.IntegrityError:
-            # Duplicate PayWay transaction – silently ignore
-            return False
-        except Exception as e:
-            logger.error("DB insert error: %s", e)
-            return False
-        finally:
-            conn.close()
-    return False
+    """Enqueue a DB insert and wait (up to 15 s) for the result."""
+    result_event = threading.Event()
+    result_holder = {"success": False}
+    db_queue.put((entry, payway_id, result_event, result_holder))
+    # Wait for the worker to finish this specific item
+    if result_event.wait(timeout=15):
+        return result_holder["success"]
+    else:
+        logger.error("DB insert timed out for Trx. ID %s", payway_id)
+        return False
 
 def delete_transaction(tran_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -740,8 +719,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "tran_id": str(uuid.uuid4()),
             "payway_trx_id": payway_id or ""
         }
-        if not add_transaction(entry, payway_id):
-            logger.info("Duplicate Trx. ID %s ignored (DB).", payway_id)
+        success = add_transaction(entry, payway_id)
+        if not success:
+            if payway_id and payway_id in SEEN_TRX_IDS:
+                logger.info("Duplicate Trx. ID %s ignored.", payway_id)
+            else:
+                logger.warning("DB insert failed for Trx. ID %s – will retry via webhook.", payway_id)
             return
         if payway_id:
             with _seen_trx_lock:
@@ -2669,6 +2652,58 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
             delay = min(delay * 2, 30)
     return False
 
+# ---------- Background DB writer (serialises SQLite inserts) ----------
+import threading
+
+def _add_transaction_sync(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
+    """Perform a single insert with retries – called ONLY by the db_worker thread."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 10000")   # 10 s
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+                 entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False              # real duplicate
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            logger.error("DB operational error (attempt %d): %s", attempt + 1, e)
+            return False
+        except Exception as e:
+            logger.error("DB insert error: %s", e)
+            return False
+        finally:
+            conn.close()
+    return False
+
+def db_worker() -> None:
+    """Process database writes one‑by‑one – never gets a lock conflict."""
+    while True:
+        try:
+            item = db_queue.get()
+            if item is None:          # sentinel to stop the worker
+                db_queue.task_done()
+                break
+            entry, payway_id, result_event, result_holder = item
+            success = _add_transaction_sync(entry, payway_id)
+            result_holder["success"] = success
+            result_event.set()        # signal that the write finished
+        except Exception as e:
+            logger.error("DB worker error: %s", e)
+        finally:
+            db_queue.task_done()
+
 def sheet_worker() -> None:
     while True:
         try:
@@ -2720,6 +2755,7 @@ threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True).start()
 threading.Thread(target=announcement_worker, args=(BOT_TOKEN,), daemon=True).start()
 threading.Thread(target=sheet_worker, daemon=True).start()
 threading.Thread(target=reminder_worker, args=(BOT_TOKEN,), daemon=True).start()
+threading.Thread(target=db_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
