@@ -220,10 +220,6 @@ def load_data() -> List[Dict[str, Any]]:
     conn.close()
     return data
 
-def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> None:
-    """Queue the insert for the background DB worker – returns immediately."""
-    db_queue.put((entry, payway_id))
-
 def delete_transaction(tran_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -1085,16 +1081,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     usd, khr, note = extract_amounts(text)
     if usd or khr:
+               # Extract PayWay transaction ID from the original raw message
         trx_match = re.search(r"Trx\.\s*ID:\s*(\d+)", text)
         payway_id = trx_match.group(1) if trx_match else None
+
+        # Quick in‑memory duplicate check (optional but fast)
         if payway_id:
             with _seen_trx_lock:
                 if payway_id in SEEN_TRX_IDS:
                     await update.message.reply_text("⏭ ប្រតិបត្តិការនេះបានកត់ត្រារួចហើយ (Trx. ID ដូចគ្នា)។")
                     return
+
         if MANUAL_LOCKED:
             await update.message.reply_text("⛔ ការកត់ត្រាដោយដៃត្រូវបានចាក់សោ។ សូមទាក់ទងម្ចាស់។")
             return
+
         entry = {
             "date": today.strftime("%Y-%m-%d"),
             "usd": usd,
@@ -1105,12 +1106,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "tran_id": str(uuid.uuid4()),
             "payway_trx_id": payway_id or ""
         }
-        if not add_transaction(entry, payway_id):
-            await update.message.reply_text("⏭ ប្រតិបត្តិការនេះមានរួចហើយ (Trx. ID ដូចគ្នា)។")
-            return
+
+        # Fire‑and‑forget DB insert (duplicate already checked in memory)
+        add_transaction(entry, payway_id)
+
+        # Remember this PayWay ID so future duplicates are caught instantly
         if payway_id:
             with _seen_trx_lock:
                 SEEN_TRX_IDS.add(payway_id)
+
+        # Queue for background sheet writes (both master & business sheets)
         append_to_sheet(entry)
         parts = []
         if usd:
@@ -1715,7 +1720,6 @@ async def undo_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     save_deleted(deleted)
     # Re-insert the entry into the database
     add_transaction(last_deleted)
-    write_master_sheet_row(last_deleted)
     append_to_sheet(last_deleted)
     await update.message.reply_text(
         f"✅ បានស្តារធាតុ: {last_deleted.get('note','')} | "
