@@ -605,7 +605,7 @@ def group_period_summary(chat_id: int, period: str, label: str, today: Optional[
     group_tag = group_business_map.get(chat_id, GROUP_BUSINESS_TAG)
     group_entries = []
     for e in all_entries:
-        src = e.get("source", "")
+        src = e.get("source") or ""
         if src.startswith(f"group_{chat_id}_"):
             group_entries.append(e)
         elif not src and e.get("business") == group_tag:
