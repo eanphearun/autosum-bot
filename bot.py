@@ -2650,8 +2650,6 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
     return False
 
 # ---------- Background DB writer (serialises SQLite inserts) ----------
-import threading
-
 def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
     """Insert a transaction immediately, using a busy timeout to wait for locks.
     Returns True on success, False if a duplicate payway_id already exists."""
