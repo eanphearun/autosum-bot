@@ -426,7 +426,7 @@ def rebuild_from_sheet() -> None:
             tran_id_val = row[7] if len(row) > 7 else str(uuid.uuid4())
             payway_trx_val = row[8] if len(row) > 8 else ""
             cur.execute(
-                "INSERT INTO transactions (id, date, usd, khr, category, note, business, timestamp, payway_trx_id) "
+                "INSERT OR IGNORE INTO transactions (id, date, usd, khr, category, note, business, timestamp, payway_trx_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (tran_id_val, date_val, usd_val, khr_val, category_val.lower(),
                  note_val[:MAX_NOTE_LEN], business_val,
