@@ -57,6 +57,7 @@ clear_confirmation_token_time: Optional[float] = None
 CLEAR_TOKEN_TTL = 120
 MANUAL_LOCKED = False
 sheet_queue = queue.Queue()
+db_queue = queue.Queue()
 SEEN_TRX_IDS: Set[str] = set()
 _seen_trx_lock = threading.Lock()
 
@@ -2650,31 +2651,40 @@ def _write_row_with_retry(sheet, row: list, max_attempts: int = 4) -> bool:
     return False
 
 # ---------- Background DB writer (serialises SQLite inserts) ----------
-def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> bool:
-    """Insert a transaction immediately, using a busy timeout to wait for locks.
-    Returns True on success, False if a duplicate payway_id already exists."""
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10.0)   # wait up to 10 s if DB is locked
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
-                 entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
-                 entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            # Duplicate PayWay transaction ID – ignore
-            return False
-        finally:
-            conn.close()
-    except sqlite3.OperationalError as e:
-        logger.error("DB insert error: %s", e)
-        return False
+def add_transaction(entry: Dict[str, Any], payway_id: Optional[str] = None) -> None:
+    """Queue the insert for the background DB worker – returns immediately."""
+    db_queue.put((entry, payway_id))
     
+def db_worker() -> None:
+    """Process database writes one‑by‑one – auto‑restarts on failure."""
+    while True:
+        try:
+            item = db_queue.get()
+            if item is None:           # sentinel to stop the worker
+                db_queue.task_done()
+                break
+            entry, payway_id = item
+            conn = sqlite3.connect(DB_FILE, timeout=3.0, check_same_thread=False)
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "INSERT OR IGNORE INTO transactions (id, date, usd, khr, category, note, business, source, timestamp, payway_trx_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (entry.get("tran_id", str(uuid.uuid4())), entry["date"], entry["usd"], entry["khr"],
+                     entry.get("category", "other"), entry.get("note", ""), entry.get("business", "manual"),
+                     entry.get("source", ""), datetime.datetime.now().isoformat(), payway_id)
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                pass   # duplicate, silently ignore
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("DB worker error: %s", e)
+            time.sleep(1)
+        finally:
+            db_queue.task_done()
+
 def sheet_worker() -> None:
     while True:
         try:
@@ -2727,6 +2737,7 @@ threading.Thread(target=sync_worker, args=(BOT_TOKEN,), daemon=True).start()
 threading.Thread(target=announcement_worker, args=(BOT_TOKEN,), daemon=True).start()
 threading.Thread(target=sheet_worker, daemon=True).start()
 threading.Thread(target=reminder_worker, args=(BOT_TOKEN,), daemon=True).start()
+threading.Thread(target=db_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
